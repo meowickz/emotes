@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title>Emote Plugin Icon</title>
+  <desc>Rounded square icon with a smiling emote face and sparkle.</desc>
+  <defs>
+    <linearGradient id="bg" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14344c"/>
+      <stop offset="0.55" stop-color="#15666b"/>
+      <stop offset="1" stop-color="#f08a4b"/>
+    </linearGradient>
+    <linearGradient id="face" x1="170" y1="160" x2="336" y2="356" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff3d9"/>
+      <stop offset="1" stop-color="#ffd9ab"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="116" fill="url(#bg)"/>
+  <circle cx="188" cy="150" r="84" fill="#ffffff" opacity="0.08"/>
+  <path d="M138 332c0-66.3 53.7-120 120-120s120 53.7 120 120c0 16.6-13.4 30-30 30H168c-16.6 0-30-13.4-30-30Z" fill="url(#face)"/>
+  <circle cx="212" cy="280" r="12" fill="#15384c"/>
+  <circle cx="300" cy="280" r="12" fill="#15384c"/>
+  <path d="M207 321c11 18 29.4 27 49 27s38-9 49-27" fill="none" stroke="#15384c" stroke-linecap="round" stroke-width="16"/>
+  <path d="M342 112l12 32 32 12-32 12-12 32-12-32-32-12 32-12 12-32Z" fill="#fff7d1"/>
+  <path d="M364 180l6 16 16 6-16 6-6 16-6-16-16-6 16-6 6-16Z" fill="#fff7d1" opacity="0.88"/>
+  <path d="M170 360c18 37 49 60 86 60 37 0 68-23 86-60H170Z" fill="#f7b36d" opacity="0.55"/>
+</svg>

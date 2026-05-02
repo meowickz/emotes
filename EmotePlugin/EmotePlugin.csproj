@@ -2,15 +2,12 @@
 <Project Sdk="Dalamud.NET.Sdk/14.0.2">
   <PropertyGroup>
     <Version>0.0.0.1</Version>
-    <PackageProjectUrl>https://github.com/goatcorp/SamplePlugin</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/azeranex/emotes</PackageProjectUrl>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="..\Data\goat.png">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
+    <ProjectReference Include="..\lib\Penumbra.Api\Penumbra.Api.csproj" />
   </ItemGroup>
 </Project>

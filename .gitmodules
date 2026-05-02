@@ -1,0 +1,3 @@
+[submodule "lib/Penumbra.Api"]
+	path = lib/Penumbra.Api
+	url = https://github.com/Ottermandias/Penumbra.Api.git

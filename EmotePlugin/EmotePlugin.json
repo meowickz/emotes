@@ -1,0 +1,15 @@
+{
+  "Author": "Meowick",
+  "Name": "Emote Plugin",
+  "Punchline": "Manage and use custom emotes with Penumbra mod integration.",
+  "Description": "An emote management plugin with Penumbra mod association. Add/remove/rename/duplicate emotes, auto-toggle Penumbra mods, search and organize your emote collection. Use /emotes to open.",
+  "ApplicableVersion": "any",
+  "RepoUrl": "https://github.com/azeranex/emotes",
+  "IconUrl": "https://raw.githubusercontent.com/azeranex/emotes/master/assets/icon.png",
+  "Changelog": "Prepared publish metadata and generated a submission icon.",
+  "Tags": [
+    "emote",
+    "penumbra",
+    "mod"
+  ]
+}

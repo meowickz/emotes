@@ -13,6 +13,17 @@
         "requested": "[1.2.39, )",
         "resolved": "1.2.39",
         "contentHash": "fcFN01tDTIQqDuTwr1jUQK/geofiwjG5DycJQOnC72i1SsLAk1ELe+apBOuZ11UMQG8YKFZG1FgvjZPbqHyatg=="
+      },
+      "Newtonsoft.Json": {
+        "type": "Transitive",
+        "resolved": "13.0.3",
+        "contentHash": "HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ=="
+      },
+      "penumbra.api": {
+        "type": "Project",
+        "dependencies": {
+          "Newtonsoft.Json": "[13.0.3, )"
+        }
       }
     }
   }
