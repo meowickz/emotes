@@ -1,23 +1,25 @@
-[
-  {
-    "Author": "Meowick",
-    "Name": "Emote Plugin",
-    "InternalName": "EmotePlugin",
-    "Punchline": "Manage and use custom emotes with Penumbra mod integration.",
-    "Description": "An emote management plugin with Penumbra mod association. Add/remove/rename/duplicate emotes, auto-toggle Penumbra mods, search and organize your emote collection. Use /emotes to open.",
-    "Changelog": "Initial release. Emote management with Penumbra mod integration, quick access widget, and folder organization.",
-    "Tags": [ "emote", "penumbra", "mod" ],
-    "RepoUrl": "https://github.com/meowickz/emotes",
-    "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-    "AssemblyVersion": "1.0.0.0",
-    "DalamudApiLevel": 15,
-    "DownloadLinkInstall": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
-    "DownloadLinkUpdate": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
-    "DownloadLinkTesting": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
-    "DownloadCount": 0,
-    "LastUpdate": 0,
-    "IsHide": false,
-    "IsTestingExclusive": false,
-    "ApplicableVersion": "any"
-  }
-]
+{
+  "Author": "Meowick",
+  "Name": "Emote Plugin",
+  "InternalName": "EmotePlugin",
+  "Punchline": "Manage and use custom emotes with Penumbra mod integration.",
+  "Description": "An emote management plugin with Penumbra mod association. Add/remove/rename/duplicate emotes, auto-toggle Penumbra mods, search and organize your emote collection. Use /emotes to open.",
+  "Changelog": "Initial release. Emote management with Penumbra mod integration, quick access widget, and folder organization.",
+  "Tags": [
+    "emote",
+    "penumbra",
+    "mod"
+  ],
+  "RepoUrl": "https://github.com/meowickz/emotes",
+  "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
+  "AssemblyVersion": "1.0.0.0",
+  "DalamudApiLevel": 15,
+  "DownloadLinkInstall": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
+  "DownloadLinkUpdate": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
+  "DownloadLinkTesting": "https://github.com/meowickz/emotes/releases/latest/download/EmotePlugin.zip",
+  "DownloadCount": 0,
+  "LastUpdate": 1777788091,
+  "IsHide": false,
+  "IsTestingExclusive": false,
+  "ApplicableVersion": "any"
+}
