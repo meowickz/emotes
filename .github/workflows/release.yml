@@ -60,11 +60,14 @@ jobs:
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin master
+        git checkout master
+        git checkout HEAD@{1} -- repo.json
         git add repo.json
         git diff --staged --quiet
         if ($LASTEXITCODE -ne 0) {
           git commit -m "Update repo.json for ${{ github.ref_name }}"
-          git push origin HEAD:master
+          git push origin master
         }
 
     - name: Create Release
