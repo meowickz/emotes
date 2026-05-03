@@ -53,7 +53,7 @@ jobs:
         $repo[0].DalamudApiLevel = [int]"${{ steps.manifest.outputs.api_level }}"
         $repo[0].LastUpdate = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $repo[0].Changelog = "${{ steps.manifest.outputs.changelog }}"
-        $repo | ConvertTo-Json -Depth 5 | Set-Content "repo.json"
+        $repo | ConvertTo-Json -Depth 5 -AsArray | Set-Content "repo.json"
 
     - name: Commit repo.json
       shell: pwsh

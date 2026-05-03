@@ -1,4 +1,4 @@
-{
+[{
   "Author": "Meowick",
   "Name": "Emote Plugin",
   "InternalName": "EmotePlugin",
@@ -22,4 +22,4 @@
   "IsHide": false,
   "IsTestingExclusive": false,
   "ApplicableVersion": "any"
-}
+}]
