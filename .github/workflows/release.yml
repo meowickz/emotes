@@ -1,0 +1,71 @@
+name: Release EmotePlugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Prepare Environment
+      uses: xivdev/Penumbra/.github/actions/prepare-environment@master
+      with:
+        project: EmotePlugin
+
+    - name: Build and Upload Artifact
+      uses: xivdev/Penumbra/.github/actions/build-with-artifact@master
+      with:
+        configuration: Release
+        project: EmotePlugin
+        version: ${{ github.ref_name }}
+
+    - name: Read manifest
+      id: manifest
+      shell: pwsh
+      run: |
+        $m = Get-Content "EmotePlugin/bin/Release/EmotePlugin.json" | ConvertFrom-Json
+        "version=$($m.AssemblyVersion)" >> $env:GITHUB_OUTPUT
+        "api_level=$($m.DalamudApiLevel)" >> $env:GITHUB_OUTPUT
+        "changelog=$($m.Changelog)" >> $env:GITHUB_OUTPUT
+
+    - name: Update repo.json
+      shell: pwsh
+      run: |
+        $repo = Get-Content "repo.json" | ConvertFrom-Json
+        $repo[0].AssemblyVersion = "${{ steps.manifest.outputs.version }}"
+        $repo[0].DalamudApiLevel = [int]"${{ steps.manifest.outputs.api_level }}"
+        $repo[0].LastUpdate = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $repo[0].Changelog = "${{ steps.manifest.outputs.changelog }}"
+        $repo | ConvertTo-Json -Depth 5 | Set-Content "repo.json"
+
+    - name: Commit repo.json
+      shell: pwsh
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add repo.json
+        git diff --staged --quiet
+        if ($LASTEXITCODE -ne 0) {
+          git commit -m "Update repo.json for ${{ github.ref_name }}"
+          git push origin HEAD:master
+        }
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: ${{ github.ref_name }}
+        body: ${{ steps.manifest.outputs.changelog }}
+        files: EmotePlugin.zip
+        fail_on_unmatched_files: true
+        make_latest: true

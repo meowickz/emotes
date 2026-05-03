@@ -71,12 +71,24 @@ public class MainWindow : Window, IDisposable
     {
         RefreshCacheIfNeeded();
 
-        // Top bar: Add emote
-        DrawTopBar();
+        using var tabs = ImRaii.TabBar("##MainTabs");
+        if (!tabs.Success) return;
 
-        ImGui.Separator();
+        using (var emotesTab = ImRaii.TabItem("Emotes"))
+        {
+            if (emotesTab.Success)
+                DrawEmotesTab();
+        }
 
-        // Two-panel layout
+        using (var settingsTab = ImRaii.TabItem("Settings"))
+        {
+            if (settingsTab.Success)
+                DrawPluginSettingsTab();
+        }
+    }
+
+    private void DrawEmotesTab()
+    {
         var availableWidth = ImGui.GetContentRegionAvail().X;
         var availableHeight = ImGui.GetContentRegionAvail().Y;
         var splitterWidth = Math.Max(4f, ImGuiHelpers.GlobalScale * 4f);
@@ -118,20 +130,50 @@ public class MainWindow : Window, IDisposable
         }
     }
 
-    private void DrawTopBar()
+    private void DrawPluginSettingsTab()
     {
-        var penumbraStatus = penumbraService.Available && penumbraService.IsPenumbraEnabled();
-        ImGui.TextColored(
-            penumbraStatus ? new Vector4(0, 1, 0, 1) : new Vector4(1, 0.3f, 0.3f, 1),
-            penumbraStatus ? "Penumbra: Connected" : "Penumbra: Unavailable");
+        ImGui.Text("Penumbra Integration");
+        ImGui.Separator();
 
+        var available = penumbraService.Available;
+        var enabled = available && penumbraService.IsPenumbraEnabled();
+
+        ImGui.Text("Status:");
         ImGui.SameLine();
-        if (ImGuiComponents.IconButton("##TopBarSettings", FontAwesomeIcon.Cog))
+        if (!available)
+            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "Not Available");
+        else if (!enabled)
+            ImGui.TextColored(new Vector4(1, 1, 0, 1), "Disabled");
+        else
+            ImGui.TextColored(new Vector4(0, 1, 0, 1), "Connected");
+
+        if (ImGui.Button("Refresh Penumbra Connection"))
+            penumbraService.CheckAvailability();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.Text($"Emotes configured: {plugin.Configuration.Emotes.Count}");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showQuickAccess = plugin.Configuration.ShowQuickAccess;
+        if (ImGui.Checkbox("Show Quick Access Widget", ref showQuickAccess))
         {
-            plugin.ToggleConfigUi();
+            plugin.Configuration.ShowQuickAccess = showQuickAccess;
+            plugin.Configuration.Save();
+            plugin.SetQuickAccessVisible(showQuickAccess);
         }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Open settings");
+
+        var alwaysRedraw = plugin.Configuration.AlwaysRedraw;
+        if (ImGui.Checkbox("Always Redraw on Emote Use", ref alwaysRedraw))
+        {
+            plugin.Configuration.AlwaysRedraw = alwaysRedraw;
+            plugin.Configuration.Save();
+        }
     }
 
     private void DrawSidebar()

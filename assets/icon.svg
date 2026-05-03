@@ -1,24 +1,65 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title>Emote Plugin Icon</title>
-  <desc>Rounded square icon with a smiling emote face and sparkle.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <linearGradient id="bg" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#14344c"/>
-      <stop offset="0.55" stop-color="#15666b"/>
-      <stop offset="1" stop-color="#f08a4b"/>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1040"/>
+      <stop offset="100%" stop-color="#0a0518"/>
     </linearGradient>
-    <linearGradient id="face" x1="170" y1="160" x2="336" y2="356" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#fff3d9"/>
-      <stop offset="1" stop-color="#ffd9ab"/>
+    <radialGradient id="glowGrad" cx="50%" cy="48%" r="45%">
+      <stop offset="0%" stop-color="#7040e0" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#7040e0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="starGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe87a"/>
+      <stop offset="100%" stop-color="#ffb020"/>
     </linearGradient>
+    <linearGradient id="starSmallGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#ffe87a"/>
+    </linearGradient>
+    <radialGradient id="skinGrad" cx="42%" cy="38%" r="60%">
+      <stop offset="0%" stop-color="#f5ddb0"/>
+      <stop offset="100%" stop-color="#ddb87a"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+    <filter id="starGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="roundedClip">
+      <rect width="512" height="512" rx="96" ry="96"/>
+    </clipPath>
   </defs>
-  <rect x="24" y="24" width="464" height="464" rx="116" fill="url(#bg)"/>
-  <circle cx="188" cy="150" r="84" fill="#ffffff" opacity="0.08"/>
-  <path d="M138 332c0-66.3 53.7-120 120-120s120 53.7 120 120c0 16.6-13.4 30-30 30H168c-16.6 0-30-13.4-30-30Z" fill="url(#face)"/>
-  <circle cx="212" cy="280" r="12" fill="#15384c"/>
-  <circle cx="300" cy="280" r="12" fill="#15384c"/>
-  <path d="M207 321c11 18 29.4 27 49 27s38-9 49-27" fill="none" stroke="#15384c" stroke-linecap="round" stroke-width="16"/>
-  <path d="M342 112l12 32 32 12-32 12-12 32-12-32-32-12 32-12 12-32Z" fill="#fff7d1"/>
-  <path d="M364 180l6 16 16 6-16 6-6 16-6-16-16-6 16-6 6-16Z" fill="#fff7d1" opacity="0.88"/>
-  <path d="M170 360c18 37 49 60 86 60 37 0 68-23 86-60H170Z" fill="#f7b36d" opacity="0.55"/>
+  <g clip-path="url(#roundedClip)">
+    <rect width="512" height="512" fill="url(#bgGrad)"/>
+    <ellipse cx="256" cy="246" rx="210" ry="200" fill="url(#glowGrad)"/>
+    <ellipse cx="256" cy="406" rx="80" ry="20" fill="#000000" opacity="0.35"/>
+    <ellipse cx="256" cy="330" rx="68" ry="62" fill="url(#skinGrad)" filter="url(#shadow)"/>
+    <path d="M 210 305 Q 158 255 148 210" stroke="#ddb87a" stroke-width="26" fill="none" stroke-linecap="round"/>
+    <circle cx="144" cy="200" r="16" fill="#ddb87a"/>
+    <path d="M 302 305 Q 354 255 364 210" stroke="#ddb87a" stroke-width="26" fill="none" stroke-linecap="round"/>
+    <circle cx="368" cy="200" r="16" fill="#ddb87a"/>
+    <ellipse cx="256" cy="246" rx="68" ry="64" fill="url(#skinGrad)" filter="url(#shadow)"/>
+    <ellipse cx="232" cy="242" rx="10" ry="11" fill="#2a1a30"/>
+    <ellipse cx="280" cy="242" rx="10" ry="11" fill="#2a1a30"/>
+    <circle cx="236" cy="238" r="3.5" fill="white" opacity="0.8"/>
+    <circle cx="284" cy="238" r="3.5" fill="white" opacity="0.8"/>
+    <path d="M 228 270 Q 256 294 284 270" stroke="#2a1a30" stroke-width="5.5" fill="none" stroke-linecap="round"/>
+    <g transform="translate(362, 142)" filter="url(#starGlow)">
+      <polygon points="0,-46 8,-8 46,0 8,8 0,46 -8,8 -46,0 -8,-8" fill="url(#starGrad)"/>
+    </g>
+    <g transform="translate(148, 168)" filter="url(#starGlow)">
+      <polygon points="0,-28 5,-5 28,0 5,5 0,28 -5,5 -28,0 -5,-5" fill="url(#starSmallGrad)" opacity="0.90"/>
+    </g>
+    <g transform="translate(398, 272)">
+      <polygon points="0,-18 3.5,-3.5 18,0 3.5,3.5 0,18 -3.5,3.5 -18,0 -3.5,-3.5" fill="url(#starSmallGrad)" opacity="0.75"/>
+    </g>
+    <g transform="translate(118, 298)">
+      <polygon points="0,-13 2.5,-2.5 13,0 2.5,2.5 0,13 -2.5,2.5 -13,0 -2.5,-2.5" fill="url(#starSmallGrad)" opacity="0.65"/>
+    </g>
+    <g transform="translate(256, 118)">
+      <polygon points="0,-11 2,-2 11,0 2,2 0,11 -2,2 -11,0 -2,-2" fill="white" opacity="0.55"/>
+    </g>
+  </g>
 </svg>

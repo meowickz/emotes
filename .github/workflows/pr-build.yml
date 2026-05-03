@@ -15,25 +15,17 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v5
-
-    - name: Install .NET
-      uses: actions/setup-dotnet@v5
       with:
-        dotnet-version: 9.0.x
+        submodules: recursive
 
-    - name: Download Dalamud
-      run: |
-        Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile latest.zip
-        Expand-Archive -Force latest.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
-
-    - name: Build with dotnet
-      run: dotnet build --configuration Release
-
-    - name: Store artifacts
-      uses: actions/upload-artifact@v4
+    - name: Prepare Environment
+      uses: xivdev/Penumbra/.github/actions/prepare-environment@master
       with:
-        name: EmotePlugin
-        path: .\EmotePlugin\bin\x64\Release\EmotePlugin\*
-        if-no-files-found: error
-        retention-days: 1
+        project: EmotePlugin
+
+    - name: Build and Upload Artifact
+      uses: xivdev/Penumbra/.github/actions/build-with-artifact@master
+      with:
+        configuration: Release
+        project: EmotePlugin
 
