@@ -22,12 +22,19 @@ jobs:
       with:
         project: EmotePlugin
 
+    - name: Get clean version
+      id: ver
+      shell: pwsh
+      run: |
+        $v = "${{ github.ref_name }}" -replace '^v'
+        "clean=$v" >> $env:GITHUB_OUTPUT
+
     - name: Build and Upload Artifact
       uses: xivdev/Penumbra/.github/actions/build-with-artifact@master
       with:
         configuration: Release
         project: EmotePlugin
-        version: ${{ github.ref_name }}
+        version: ${{ steps.ver.outputs.clean }}
 
     - name: Read manifest
       id: manifest
