@@ -3,8 +3,16 @@ using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using Newtonsoft.Json;
 
 namespace EmotePlugin;
+
+[Serializable]
+public class EmoteSetExport
+{
+    public int Version { get; set; } = 1;
+    public EmoteFolder Root { get; set; } = new();
+}
 
 public class EmoteManager
 {
@@ -13,6 +21,7 @@ public class EmoteManager
     private readonly IPluginLog log;
 
     private EmoteEntry? lastUsedEmote;
+    private string? lastUsedCommand;
 
     public EmoteManager(Configuration configuration, PenumbraService penumbraService, IPluginLog log)
     {
@@ -24,18 +33,13 @@ public class EmoteManager
     public EmoteFolder GetRootFolder() => configuration.RootFolder;
 
     public List<EmoteEntry> GetAllEmotes()
-    {
-        var result = new List<EmoteEntry>();
-        CollectEmotes(configuration.RootFolder, result);
-        return result;
-    }
+        => configuration.RootFolder.EnumerateEmotes().ToList();
 
-    private void CollectEmotes(EmoteFolder folder, List<EmoteEntry> result)
-    {
-        result.AddRange(folder.Emotes);
-        foreach (var sub in folder.Folders)
-            CollectEmotes(sub, result);
-    }
+    public int GetEmoteCount()
+        => CountEmotes(configuration.RootFolder);
+
+    private static int CountEmotes(EmoteFolder folder)
+        => folder.Emotes.Count + folder.Folders.Sum(CountEmotes);
 
     public List<EmoteEntry> SearchEmotes(string query)
     {
@@ -44,18 +48,22 @@ public class EmoteManager
 
         return GetAllEmotes()
             .Where(e => e.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                        e.EmoteCommand.Contains(query, StringComparison.OrdinalIgnoreCase))
+                        e.Commands.Any(c => c.Command.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                                            c.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                                            c.Alias.Contains(query, StringComparison.OrdinalIgnoreCase)))
             .ToList();
     }
 
     public EmoteEntry AddEmote(string name, string emoteCommand = "", EmoteFolder? folder = null)
     {
         folder ??= configuration.RootFolder;
-        var entry = new EmoteEntry
+        var entry = new EmoteEntry { Name = name };
+        if (!string.IsNullOrWhiteSpace(emoteCommand))
         {
-            Name = name,
-            EmoteCommand = emoteCommand,
-        };
+            var row = new EmoteCommandEntry { Command = emoteCommand };
+            entry.Commands.Add(row);
+            entry.DefaultCommandId = row.Id;
+        }
         folder.Emotes.Add(entry);
         configuration.Save();
         return entry;
@@ -64,7 +72,10 @@ public class EmoteManager
     public void RemoveEmote(EmoteEntry emote)
     {
         if (lastUsedEmote?.Id == emote.Id)
+        {
             lastUsedEmote = null;
+            lastUsedCommand = null;
+        }
         var folder = FindParentFolder(emote);
         folder?.Emotes.Remove(emote);
         configuration.Save();
@@ -93,7 +104,19 @@ public class EmoteManager
 
     public void UseEmote(EmoteEntry emote)
     {
-        if (string.IsNullOrWhiteSpace(emote.EmoteCommand))
+        var cmd = emote.GetDefaultCommand();
+        if (cmd == null)
+        {
+            log.Warning($"Emote '{emote.Name}' has no enabled command.");
+            return;
+        }
+
+        UseEmote(emote, cmd);
+    }
+
+    public void UseEmote(EmoteEntry emote, EmoteCommandEntry cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd.Command))
         {
             log.Warning($"Emote '{emote.Name}' has no command set.");
             return;
@@ -102,8 +125,8 @@ public class EmoteManager
         // Remove previous emote's temporary mod settings before applying new ones
         if (emote.AutoToggleMod)
         {
-            var lastCmd = lastUsedEmote?.EmoteCommand?.TrimStart('/');
-            var normalizedCmd = emote.EmoteCommand.TrimStart('/');
+            var lastCmd = lastUsedCommand?.TrimStart('/');
+            var normalizedCmd = cmd.Command.TrimStart('/');
             var needsRedraw = configuration.AlwaysRedraw ||
                 (lastCmd != null && lastCmd.Equals(normalizedCmd, StringComparison.OrdinalIgnoreCase));
 
@@ -118,6 +141,7 @@ public class EmoteManager
             }
 
             lastUsedEmote = emote;
+            lastUsedCommand = cmd.Command;
 
             // Only redraw if the previous emote used the same command (same animation source)
             if (needsRedraw)
@@ -127,7 +151,7 @@ public class EmoteManager
         }
 
         // Send the emote command via chat
-        var command = emote.EmoteCommand;
+        var command = cmd.Command;
         if (!command.StartsWith('/'))
             command = "/" + command;
 
@@ -171,6 +195,21 @@ public class EmoteManager
             mod.ModDirectory, mod.Enabled, mod.Inherit, mod.Priority,
             emote.PenumbraCollectionId, mod.ModName, mod.Settings);
         penumbraService.RedrawSelf();
+    }
+
+    /// <summary>
+    /// Copy the mod's current option settings from Penumbra into the association,
+    /// leaving enabled state and priority untouched.
+    /// </summary>
+    public void SyncModSettingsFromPenumbra(EmoteEntry emote, ModAssociation mod)
+    {
+        var (_, _, settings) = penumbraService.GetModSettings(
+            mod.ModDirectory, emote.PenumbraCollectionId, mod.ModName);
+        if (settings.Count == 0)
+            return;
+
+        mod.Settings = settings;
+        configuration.Save();
     }
 
     public void ReapplyModFromPenumbra(EmoteEntry emote, ModAssociation mod)
@@ -302,6 +341,122 @@ public class EmoteManager
         return false;
     }
 
+    public string ExportToJson()
+    {
+        return JsonConvert.SerializeObject(
+            new EmoteSetExport { Root = configuration.RootFolder }, Formatting.Indented);
+    }
+
+    public static EmoteFolder? ParseImport(string json)
+    {
+        var data = JsonConvert.DeserializeObject<EmoteSetExport>(json);
+        if (data?.Root == null)
+            return null;
+
+        // Sanitize immediately — the import review UI walks this tree before ImportEmotes runs
+        SanitizeImport(data.Root);
+        return data.Root;
+    }
+
+    public void ImportEmotes(EmoteFolder importedRoot)
+    {
+        SanitizeImport(importedRoot);
+        Configuration.MigrateAllCommands(importedRoot);
+        RegenerateIds(importedRoot);
+        ClearDuplicateAliases(importedRoot);
+        configuration.RootFolder.Emotes.AddRange(importedRoot.Emotes);
+        configuration.RootFolder.Folders.AddRange(importedRoot.Folders);
+        configuration.Save();
+    }
+
+    /// <summary>
+    /// Repair null fields/entries in externally produced import files so they can't
+    /// crash later or persist nulls into the config.
+    /// </summary>
+    private static void SanitizeImport(EmoteFolder folder)
+    {
+        folder.Name ??= string.Empty;
+        folder.Folders ??= new List<EmoteFolder>();
+        folder.Emotes ??= new List<EmoteEntry>();
+        folder.Folders.RemoveAll(f => f == null);
+        folder.Emotes.RemoveAll(e => e == null);
+
+        foreach (var emote in folder.Emotes)
+        {
+            emote.Name ??= string.Empty;
+            emote.Alias ??= string.Empty;
+            emote.EmoteCommand ??= string.Empty;
+            emote.Commands ??= new List<EmoteCommandEntry>();
+            emote.Commands.RemoveAll(c => c == null);
+            foreach (var cmd in emote.Commands)
+            {
+                cmd.Name ??= string.Empty;
+                cmd.Command ??= string.Empty;
+                cmd.Alias ??= string.Empty;
+            }
+
+            emote.AssociatedMods ??= new List<ModAssociation>();
+            emote.AssociatedMods.RemoveAll(m => m == null);
+            foreach (var mod in emote.AssociatedMods)
+            {
+                mod.ModDirectory ??= string.Empty;
+                mod.ModName ??= string.Empty;
+                mod.Settings ??= new Dictionary<string, List<string>>();
+                foreach (var key in mod.Settings.Where(kv => kv.Value == null).Select(kv => kv.Key).ToList())
+                    mod.Settings[key] = new List<string>();
+            }
+        }
+
+        foreach (var sub in folder.Folders)
+            SanitizeImport(sub);
+    }
+
+    /// <summary>
+    /// Aliases must stay unique for /emotes resolution — clear imported aliases that
+    /// collide with existing ones (or repeat within the import itself).
+    /// </summary>
+    private void ClearDuplicateAliases(EmoteFolder importedRoot)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var emote in configuration.RootFolder.EnumerateEmotes())
+        foreach (var cmd in emote.Commands)
+        {
+            if (!string.IsNullOrWhiteSpace(cmd.Alias))
+                seen.Add(cmd.Alias);
+        }
+
+        foreach (var emote in importedRoot.EnumerateEmotes())
+        foreach (var cmd in emote.Commands)
+        {
+            if (string.IsNullOrWhiteSpace(cmd.Alias))
+                continue;
+            if (!seen.Add(cmd.Alias))
+            {
+                log.Warning($"Imported alias '{cmd.Alias}' on '{emote.Name}' already exists — cleared to keep /emotes unambiguous.");
+                cmd.Alias = string.Empty;
+            }
+        }
+    }
+
+    private static void RegenerateIds(EmoteFolder root)
+    {
+        foreach (var folder in root.SelfAndDescendants())
+        {
+            folder.Id = Guid.NewGuid();
+            foreach (var emote in folder.Emotes)
+            {
+                emote.Id = Guid.NewGuid();
+                foreach (var cmd in emote.Commands)
+                {
+                    var oldId = cmd.Id;
+                    cmd.Id = Guid.NewGuid();
+                    if (emote.DefaultCommandId == oldId)
+                        emote.DefaultCommandId = cmd.Id;
+                }
+            }
+        }
+    }
+
     public void DisableAllEmoteMods()
     {
         foreach (var e in GetAllEmotes())
@@ -312,6 +467,7 @@ public class EmoteManager
             }
         }
         lastUsedEmote = null;
+        lastUsedCommand = null;
         penumbraService.RedrawSelf();
     }
 }

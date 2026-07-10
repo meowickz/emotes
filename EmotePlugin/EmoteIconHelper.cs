@@ -9,7 +9,11 @@ namespace EmotePlugin;
 
 public class EmoteIconHelper
 {
+    private const uint ExpressionsCategoryRowId = 3;
+
     private readonly Dictionary<string, uint> iconCache = new(System.StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> nameToCommand = new(System.StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> expressionCommands = new(System.StringComparer.OrdinalIgnoreCase);
     private readonly ITextureProvider textureProvider;
 
     public EmoteIconHelper(ITextureProvider textureProvider, IDataManager dataManager)
@@ -31,7 +35,16 @@ public class EmoteIconHelper
 
             var cmd = textCommand.Value.Command.ExtractText();
             if (!string.IsNullOrEmpty(cmd))
+            {
                 iconCache.TryAdd(cmd, emote.Icon);
+
+                var emoteName = emote.Name.ExtractText();
+                if (!string.IsNullOrEmpty(emoteName))
+                    nameToCommand.TryAdd(emoteName, cmd);
+
+                if (emote.EmoteCategory.RowId == ExpressionsCategoryRowId)
+                    expressionCommands.Add(cmd);
+            }
 
             var alias = textCommand.Value.Alias.ExtractText();
             if (!string.IsNullOrEmpty(alias))
@@ -45,6 +58,35 @@ public class EmoteIconHelper
             if (!string.IsNullOrEmpty(shortAlias))
                 iconCache.TryAdd(shortAlias, emote.Icon);
         }
+    }
+
+    /// <summary>
+    /// Resolve a Penumbra changed-item name (e.g. "Emote: Sundrop Dance") to an emote
+    /// slash command plus the cleaned display name. Null when it is not an emote.
+    /// </summary>
+    public (string Command, string Name)? ResolveEmote(string changedItemName)
+    {
+        var name = changedItemName.Trim();
+        if (name.StartsWith("Emote:", System.StringComparison.OrdinalIgnoreCase))
+            name = name["Emote:".Length..].Trim();
+
+        if (nameToCommand.TryGetValue(name, out var cmd))
+            return (cmd, name);
+
+        // Some changed items may already be a command string
+        if (name.StartsWith('/') && iconCache.ContainsKey(name))
+            return (name, name);
+
+        return null;
+    }
+
+    /// <summary> Whether the given slash command is a facial expression emote. </summary>
+    public bool IsExpressionCommand(string command)
+    {
+        var cmd = command.Trim();
+        if (!cmd.StartsWith('/'))
+            cmd = "/" + cmd;
+        return expressionCommands.Contains(cmd);
     }
 
     public void DrawIcon(string emoteCommand, float size)

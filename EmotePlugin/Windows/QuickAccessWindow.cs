@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Conditions;
@@ -19,8 +21,80 @@ public class QuickAccessWindow : Window, IDisposable
     private readonly ICondition condition;
 
     private string filterQuery = string.Empty;
-    private int selectedIndex = -1;
     private bool comboOpen;
+    private float wheelAccumulator;
+
+    // Selection tracked by identity, not position — the item list changes shape
+    private Guid selectedEmoteId;
+    private Guid selectedCmdId;
+
+    // Item list cached across frames; rebuilt when the config changes
+    private List<QuickItem>? cachedItems;
+    private int cachedRevision = -1;
+    private bool cachedShowSub;
+
+    private sealed record QuickItem(EmoteEntry Emote, EmoteCommandEntry? Cmd, string Label);
+
+    private List<QuickItem> GetItems()
+    {
+        var showSub = plugin.Configuration.QuickAccessShowSubCommands;
+        if (cachedItems == null || cachedRevision != plugin.Configuration.Revision || cachedShowSub != showSub)
+        {
+            cachedItems = BuildItems(showSub);
+            cachedRevision = plugin.Configuration.Revision;
+            cachedShowSub = showSub;
+        }
+
+        return cachedItems;
+    }
+
+    private List<QuickItem> BuildItems(bool showSub)
+    {
+        var items = new List<QuickItem>();
+
+        foreach (var emote in emoteManager.GetAllEmotes())
+        {
+            if (showSub)
+            {
+                var enabledCmds = emote.Commands.Where(c => c.Enabled).ToList();
+                if (enabledCmds.Count > 1)
+                {
+                    foreach (var cmd in enabledCmds)
+                    {
+                        var subName = string.IsNullOrWhiteSpace(cmd.Name) ? cmd.Command : cmd.Name;
+                        items.Add(new QuickItem(emote, cmd, $"{emote.Name} · {subName}"));
+                    }
+
+                    continue;
+                }
+            }
+
+            items.Add(new QuickItem(emote, null, emote.Name));
+        }
+
+        return items;
+    }
+
+    private void SetSelected(QuickItem item)
+    {
+        selectedEmoteId = item.Emote.Id;
+        selectedCmdId = item.Cmd?.Id ?? Guid.Empty;
+    }
+
+    private bool MatchesFilter(QuickItem item)
+    {
+        if (item.Emote.Name.Contains(filterQuery, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (item.Cmd != null)
+            return item.Cmd.Name.Contains(filterQuery, StringComparison.OrdinalIgnoreCase) ||
+                   item.Cmd.Command.Contains(filterQuery, StringComparison.OrdinalIgnoreCase) ||
+                   item.Cmd.Alias.Contains(filterQuery, StringComparison.OrdinalIgnoreCase);
+
+        return item.Emote.Commands.Any(c =>
+            c.Command.Contains(filterQuery, StringComparison.OrdinalIgnoreCase) ||
+            c.Alias.Contains(filterQuery, StringComparison.OrdinalIgnoreCase));
+    }
 
     public QuickAccessWindow(Plugin plugin, EmoteManager emoteManager, PenumbraService penumbraService,
         EmoteIconHelper emoteIconHelper, IClientState clientState, ICondition condition)
@@ -69,8 +143,8 @@ public class QuickAccessWindow : Window, IDisposable
         ImGui.PushStyleColor(ImGuiCol.FrameBgActive, darkActive);
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, ImGui.GetStyle().FrameRounding);
 
-        var emotes = emoteManager.GetAllEmotes();
-        if (emotes.Count == 0)
+        var items = GetItems();
+        if (items.Count == 0)
         {
             ImGui.TextDisabled("No emotes configured.");
             ImGui.PopStyleColor(6);
@@ -78,15 +152,25 @@ public class QuickAccessWindow : Window, IDisposable
             return;
         }
 
-        // Clamp selected index
-        if (selectedIndex < 0 || selectedIndex >= emotes.Count)
+        // Resolve the stored selection by identity; fall back to the first item
+        var selectedIndex = items.FindIndex(i =>
+            i.Emote.Id == selectedEmoteId && (i.Cmd?.Id ?? Guid.Empty) == selectedCmdId);
+        if (selectedIndex < 0)
+        {
             selectedIndex = 0;
+            SetSelected(items[0]);
+        }
 
-        var selected = emotes[selectedIndex];
+        var selected = items[selectedIndex];
 
-        // Combo with filter
-        ImGui.SetNextItemWidth(250f);
-        if (ImGui.BeginCombo("##QuickEmoteSelect", selected.Name))
+        var buttonSize = new Vector2(ImGui.GetFrameHeight());
+        var buttonGap = ImGui.GetStyle().ItemSpacing.X * 0.5f;
+        var comboWidth = 250f;
+
+        // Combo with filter; pin the popup to the combo width so it doesn't open wide and shrink
+        ImGui.SetNextItemWidth(comboWidth);
+        ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 300f));
+        if (ImGui.BeginCombo("##QuickEmoteSelect", selected.Label))
         {
             // Filter input
             ImGui.SetNextItemWidth(-1);
@@ -97,21 +181,17 @@ public class QuickAccessWindow : Window, IDisposable
             }
             ImGui.InputTextWithHint("##QuickFilter", "Filter...", ref filterQuery, 256);
 
-            for (var i = 0; i < emotes.Count; i++)
+            for (var i = 0; i < items.Count; i++)
             {
-                var emote = emotes[i];
+                var item = items[i];
 
-                // Apply filter
-                if (!string.IsNullOrEmpty(filterQuery) &&
-                    !emote.Name.Contains(filterQuery, StringComparison.OrdinalIgnoreCase) &&
-                    !emote.EmoteCommand.Contains(filterQuery, StringComparison.OrdinalIgnoreCase) &&
-                    !emote.Alias.Contains(filterQuery, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(filterQuery) && !MatchesFilter(item))
                     continue;
 
                 var isSelected = i == selectedIndex;
-                if (ImGui.Selectable(emote.Name, isSelected))
+                if (ImGui.Selectable($"{item.Label}##{i}", isSelected))
                 {
-                    selectedIndex = i;
+                    SetSelected(item);
                     filterQuery = string.Empty;
                 }
 
@@ -126,45 +206,56 @@ public class QuickAccessWindow : Window, IDisposable
             comboOpen = false;
         }
 
-        ImGui.SameLine();
+        // Mouse wheel over the closed combo cycles the selection.
+        // Accumulate fractional deltas so precision touchpads/free-spin wheels work.
+        if (ImGui.IsItemHovered())
+        {
+            wheelAccumulator += ImGui.GetIO().MouseWheel;
+            var steps = (int)wheelAccumulator;
+            if (steps != 0)
+            {
+                wheelAccumulator -= steps;
+                var newIndex = Math.Clamp(selectedIndex - steps, 0, items.Count - 1);
+                SetSelected(items[newIndex]);
+            }
+        }
+        else
+        {
+            wheelAccumulator = 0;
+        }
+
+        ImGui.SameLine(0, buttonGap);
 
         // Play button
-        if (ImGuiComponents.IconButton("##QuickPlay", FontAwesomeIcon.Play))
+        if (ImGuiComponents.IconButton("##QuickPlay", FontAwesomeIcon.Play, buttonSize))
         {
-            emoteManager.UseEmote(selected);
+            if (selected.Cmd != null)
+                emoteManager.UseEmote(selected.Emote, selected.Cmd);
+            else
+                emoteManager.UseEmote(selected.Emote);
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Play emote");
 
-        ImGui.SameLine();
+        ImGui.SameLine(0, buttonGap);
 
         // Disable all mods button
-        if (ImGuiComponents.IconButton("##QuickDisable", FontAwesomeIcon.Ban))
+        if (ImGuiComponents.IconButton("##QuickDisable", FontAwesomeIcon.Ban, buttonSize))
         {
             emoteManager.DisableAllEmoteMods();
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Disable all temporary mods");
 
-        ImGui.SameLine();
+        ImGui.SameLine(0, buttonGap);
 
         // Open main window button
-        if (ImGuiComponents.IconButton("##QuickMain", FontAwesomeIcon.List))
+        if (ImGuiComponents.IconButton("##QuickMain", FontAwesomeIcon.List, buttonSize))
         {
             plugin.ToggleMainUi();
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Open main window");
-
-        ImGui.SameLine();
-
-        // Settings button
-        if (ImGuiComponents.IconButton("##QuickSettings", FontAwesomeIcon.Cog))
-        {
-            plugin.ToggleConfigUi();
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Open settings");
 
         ImGui.PopStyleColor(6);
         ImGui.PopStyleVar();

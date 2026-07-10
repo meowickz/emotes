@@ -4,6 +4,7 @@ using System.Linq;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Penumbra.Api.Enums;
+using Penumbra.Api.Helpers;
 using Penumbra.Api.IpcSubscribers;
 
 namespace EmotePlugin;
@@ -21,7 +22,12 @@ public class PenumbraService : IDisposable
     private readonly GetModList getModList;
     private readonly GetCollections getCollections;
     private readonly GetCollection getCollection;
-    private readonly GetCurrentModSettings getCurrentModSettings;
+    private readonly GetChangedItems getChangedItems;
+    private readonly GetChangedItemAdapterDictionary getAllChangedItems;
+    private readonly GetAvailableModSettings getAvailableModSettings;
+    private readonly GetCurrentModSettingsWithTemp getCurrentModSettings;
+    private readonly EventSubscriber penumbraInitialized;
+    private readonly EventSubscriber penumbraDisposed;
     private readonly SetTemporaryModSettings setTemporaryModSettings;
     private readonly RemoveTemporaryModSettings removeTemporaryModSettings;
     private readonly RemoveAllTemporaryModSettings removeAllTemporaryModSettings;
@@ -42,12 +48,19 @@ public class PenumbraService : IDisposable
         getModList = new GetModList(pi);
         getCollections = new GetCollections(pi);
         getCollection = new GetCollection(pi);
-        getCurrentModSettings = new GetCurrentModSettings(pi);
+        getChangedItems = new GetChangedItems(pi);
+        getAllChangedItems = new GetChangedItemAdapterDictionary(pi);
+        getAvailableModSettings = new GetAvailableModSettings(pi);
+        getCurrentModSettings = new GetCurrentModSettingsWithTemp(pi);
         setTemporaryModSettings = new SetTemporaryModSettings(pi);
         removeTemporaryModSettings = new RemoveTemporaryModSettings(pi);
         removeAllTemporaryModSettings = new RemoveAllTemporaryModSettings(pi);
         openMainWindow = new OpenMainWindow(pi);
         redrawObject = new RedrawObject(pi);
+
+        // Recover when Penumbra loads after this plugin or reloads mid-session
+        penumbraInitialized = Initialized.Subscriber(pi, CheckAvailability);
+        penumbraDisposed = Disposed.Subscriber(pi, () => Available = false);
 
         CheckAvailability();
     }
@@ -89,6 +102,55 @@ public class PenumbraService : IDisposable
         {
             log.Error($"Failed to get mod list: {ex.Message}");
             return new Dictionary<string, string>();
+        }
+    }
+
+    public Dictionary<string, object?> GetChangedItems(string modDirectory, string modName = "")
+    {
+        if (!Available) return new Dictionary<string, object?>();
+        try
+        {
+            return getChangedItems.Invoke(modDirectory, modName);
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to get changed items for '{modDirectory}': {ex.Message}");
+            return new Dictionary<string, object?>();
+        }
+    }
+
+    /// <summary>
+    /// Changed item names of every installed mod: mod directory -> changed item names.
+    /// Materialized inside the guard — the adapter Penumbra returns throws
+    /// ObjectDisposedException when accessed after mod storage is invalidated.
+    /// </summary>
+    public Dictionary<string, string[]> GetAllChangedItemNames()
+    {
+        if (!Available) return new Dictionary<string, string[]>();
+        try
+        {
+            return getAllChangedItems.Invoke()
+                .ToDictionary(kv => kv.Key, kv => kv.Value.Keys.ToArray());
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to get changed items for all mods: {ex.Message}");
+            return new Dictionary<string, string[]>();
+        }
+    }
+
+    /// <summary> The mod's option groups: group name -> (options, group type). Null if the mod is unknown. </summary>
+    public IReadOnlyDictionary<string, (string[] Options, GroupType Type)>? GetAvailableModSettings(string modDirectory, string modName = "")
+    {
+        if (!Available) return null;
+        try
+        {
+            return getAvailableModSettings.Invoke(modDirectory, modName);
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to get available settings for '{modDirectory}': {ex.Message}");
+            return null;
         }
     }
 
@@ -207,7 +269,10 @@ public class PenumbraService : IDisposable
             var targetCollection = collectionId == Guid.Empty ? GetCurrentCollectionId() : collectionId;
             if (targetCollection == Guid.Empty) return (false, 0, new());
 
-            var (ec, settings) = getCurrentModSettings.Invoke(targetCollection, modDirectory, modName);
+            // ignoreTemporary: true — snapshots must capture the user's permanent
+            // configuration, not temporary settings (possibly our own) currently applied
+            var (ec, settings) = getCurrentModSettings.Invoke(
+                targetCollection, modDirectory, modName, ignoreInheritance: false, ignoreTemporary: true, key: 0);
             if (ec != PenumbraApiEc.Success || settings == null) return (false, 0, new());
 
             // Item1=enabled, Item2=priority, Item3=option settings dict
@@ -234,6 +299,9 @@ public class PenumbraService : IDisposable
 
     public void Dispose()
     {
+        penumbraInitialized.Dispose();
+        penumbraDisposed.Dispose();
+
         // Clean up all temporary settings we applied across all collections
         try
         {

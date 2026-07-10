@@ -9,6 +9,9 @@ public class ModAssociation
 {
     public string ModDirectory { get; set; } = string.Empty;
     public string ModName { get; set; } = string.Empty;
+
+    [Newtonsoft.Json.JsonIgnore]
+    public string DisplayName => string.IsNullOrWhiteSpace(ModName) ? ModDirectory : ModName;
     public bool Enabled { get; set; } = true;
     public bool Inherit { get; set; }
     public int Priority { get; set; } = 1;

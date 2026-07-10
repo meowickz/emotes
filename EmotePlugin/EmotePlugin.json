@@ -6,7 +6,7 @@
   "ApplicableVersion": "any",
   "RepoUrl": "https://github.com/meowickz/emotes",
   "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-  "Changelog": "Initial release. Emote management with Penumbra mod integration, quick access widget, and folder organization.",
+  "Changelog": "Multi-command emotes with aliases and defaults, detect commands from mods, inline mod settings editor, emote slot conflict warnings, import/export with mod remapping, quick access sub-commands and polish, What's New window.",
   "Tags": [
     "emote",
     "penumbra",

@@ -23,9 +23,9 @@ public sealed class Plugin : IDalamudPlugin
     public Configuration Configuration { get; init; }
 
     public readonly WindowSystem WindowSystem = new("EmotePlugin");
-    private ConfigWindow ConfigWindow { get; init; }
     private MainWindow MainWindow { get; init; }
     private QuickAccessWindow QuickAccessWindow { get; init; }
+    private WhatsNewWindow WhatsNewWindow { get; init; }
 
     private PenumbraService PenumbraService { get; init; }
     private EmoteManager EmoteManager { get; init; }
@@ -39,16 +39,18 @@ public sealed class Plugin : IDalamudPlugin
         EmoteManager = new EmoteManager(Configuration, PenumbraService, Log);
 
         var emoteIconHelper = new EmoteIconHelper(TextureProvider, DataManager);
-        ConfigWindow = new ConfigWindow(this, PenumbraService);
         MainWindow = new MainWindow(this, EmoteManager, PenumbraService, emoteIconHelper);
         QuickAccessWindow = new QuickAccessWindow(this, EmoteManager, PenumbraService, emoteIconHelper, clientState, Condition);
+        WhatsNewWindow = new WhatsNewWindow();
 
-        WindowSystem.AddWindow(ConfigWindow);
         WindowSystem.AddWindow(MainWindow);
         WindowSystem.AddWindow(QuickAccessWindow);
+        WindowSystem.AddWindow(WhatsNewWindow);
 
         if (Configuration.ShowQuickAccess)
             QuickAccessWindow.IsOpen = true;
+
+        ShowWhatsNewOnUpdate();
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
@@ -56,6 +58,7 @@ public sealed class Plugin : IDalamudPlugin
         });
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
+        PluginInterface.UiBuilder.Draw += MainWindow.DrawOverlays;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
@@ -65,14 +68,15 @@ public sealed class Plugin : IDalamudPlugin
     public void Dispose()
     {
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
+        PluginInterface.UiBuilder.Draw -= MainWindow.DrawOverlays;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
 
         WindowSystem.RemoveAllWindows();
 
-        ConfigWindow.Dispose();
         MainWindow.Dispose();
         QuickAccessWindow.Dispose();
+        WhatsNewWindow.Dispose();
         PenumbraService.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
@@ -83,11 +87,26 @@ public sealed class Plugin : IDalamudPlugin
         var trimmed = args.Trim();
         if (!string.IsNullOrEmpty(trimmed))
         {
-            var emote = EmoteManager.GetAllEmotes().FirstOrDefault(
-                e => e.Alias.Equals(trimmed, StringComparison.OrdinalIgnoreCase));
-            if (emote != null)
+            var matchedDisabled = false;
+            foreach (var emote in EmoteManager.GetAllEmotes())
             {
-                EmoteManager.UseEmote(emote);
+                var cmd = emote.Commands.FirstOrDefault(
+                    c => c.Alias.Equals(trimmed, StringComparison.OrdinalIgnoreCase));
+                if (cmd == null)
+                    continue;
+                if (cmd.Enabled)
+                {
+                    EmoteManager.UseEmote(emote, cmd);
+                    return;
+                }
+
+                matchedDisabled = true;
+            }
+
+            // A disabled alias should not fall through to toggling the window (macros!)
+            if (matchedDisabled)
+            {
+                Log.Warning($"Alias '{trimmed}' matches a disabled command — enable it in the emote editor to use it.");
                 return;
             }
         }
@@ -95,7 +114,26 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Toggle();
     }
 
-    public void ToggleConfigUi() => ConfigWindow.Toggle();
+    public void ToggleConfigUi() => MainWindow.ToggleSettings();
+    public void ShowWhatsNew() => WhatsNewWindow.IsOpen = true;
+
+    private void ShowWhatsNewOnUpdate()
+    {
+        // Gate on the changelog's own latest entry, not the assembly version —
+        // a release without new notes must not re-show stale ones.
+        var currentVersion = WhatsNewWindow.LatestVersion;
+        if (Configuration.LastSeenVersion == currentVersion)
+            return;
+
+        // Only show for updates, not fresh installs: an existing config has emotes or a recorded version.
+        var isUpdate = !string.IsNullOrEmpty(Configuration.LastSeenVersion) ||
+                       EmoteManager.GetAllEmotes().Count > 0;
+        if (isUpdate)
+            WhatsNewWindow.IsOpen = true;
+
+        Configuration.LastSeenVersion = currentVersion;
+        Configuration.Save();
+    }
     public void ToggleMainUi() => MainWindow.Toggle();
 
     public void ToggleQuickAccess()
