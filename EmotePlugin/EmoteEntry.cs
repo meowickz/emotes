@@ -13,6 +13,9 @@ public class EmoteCommandEntry
     public string Alias { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
 
+    /// <summary> 1-based /cpose pose to select before playing (sit/groundsit/doze only); 0 = keep current. </summary>
+    public int PoseIndex { get; set; }
+
     public EmoteCommandEntry Clone()
     {
         return new EmoteCommandEntry
@@ -22,6 +25,7 @@ public class EmoteCommandEntry
             Command = Command,
             Alias = string.Empty,
             Enabled = Enabled,
+            PoseIndex = PoseIndex,
         };
     }
 }

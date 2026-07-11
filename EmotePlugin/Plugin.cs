@@ -17,6 +17,8 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
+    [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
 
     private const string CommandName = "/emotes";
 
@@ -36,9 +38,8 @@ public sealed class Plugin : IDalamudPlugin
         Configuration.Migrate();
 
         PenumbraService = new PenumbraService(PluginInterface, Log);
-        EmoteManager = new EmoteManager(Configuration, PenumbraService, Log);
-
         var emoteIconHelper = new EmoteIconHelper(TextureProvider, DataManager);
+        EmoteManager = new EmoteManager(Configuration, PenumbraService, emoteIconHelper, Framework, ObjectTable, Log);
         MainWindow = new MainWindow(this, EmoteManager, PenumbraService, emoteIconHelper);
         QuickAccessWindow = new QuickAccessWindow(this, EmoteManager, PenumbraService, emoteIconHelper, clientState, Condition);
         WhatsNewWindow = new WhatsNewWindow();
@@ -77,6 +78,7 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Dispose();
         QuickAccessWindow.Dispose();
         WhatsNewWindow.Dispose();
+        EmoteManager.Dispose();
         PenumbraService.Dispose();
 
         CommandManager.RemoveHandler(CommandName);

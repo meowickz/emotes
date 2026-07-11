@@ -18,6 +18,7 @@ public class PenumbraService : IDisposable
     private readonly IPluginLog log;
 
     private readonly ApiVersion apiVersion;
+    private readonly GetModDirectory getModDirectory;
     private readonly GetEnabledState getEnabledState;
     private readonly GetModList getModList;
     private readonly GetCollections getCollections;
@@ -44,6 +45,7 @@ public class PenumbraService : IDisposable
         this.log = log;
 
         apiVersion = new ApiVersion(pi);
+        getModDirectory = new GetModDirectory(pi);
         getEnabledState = new GetEnabledState(pi);
         getModList = new GetModList(pi);
         getCollections = new GetCollections(pi);
@@ -75,6 +77,21 @@ public class PenumbraService : IDisposable
         catch
         {
             Available = false;
+        }
+    }
+
+    /// <summary> Penumbra's root mod directory on disk, or empty when unavailable. </summary>
+    public string GetModRootDirectory()
+    {
+        if (!Available) return string.Empty;
+        try
+        {
+            return getModDirectory.Invoke();
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Failed to get mod directory: {ex.Message}");
+            return string.Empty;
         }
     }
 

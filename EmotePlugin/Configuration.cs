@@ -26,6 +26,9 @@ public class Configuration : IPluginConfiguration
 
     public bool AlwaysRedraw { get; set; } = false;
 
+    /// <summary> Play /sit and /doze via the game's hidden furniture emote — works without a chair/bed. </summary>
+    public bool SitDozeAnywhere { get; set; } = false;
+
     /// <summary>
     /// Migrate legacy formats: flat Emotes list into RootFolder tree,
     /// and single command/alias fields into per-emote command lists.

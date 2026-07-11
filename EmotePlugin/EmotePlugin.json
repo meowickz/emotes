@@ -6,7 +6,7 @@
   "ApplicableVersion": "any",
   "RepoUrl": "https://github.com/meowickz/emotes",
   "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-  "Changelog": "Multi-command emotes with aliases and defaults, detect commands from mods, inline mod settings editor, emote slot conflict warnings, import/export with mod remapping, quick access sub-commands and polish, What's New window.",
+  "Changelog": "Direct pose selection for sit/groundsit/doze with auto-detection from mod files, Sit/Doze Anywhere option, selective import with folder merging.",
   "Tags": [
     "emote",
     "penumbra",

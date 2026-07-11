@@ -10,10 +10,25 @@ namespace EmotePlugin;
 public class EmoteIconHelper
 {
     private const uint ExpressionsCategoryRowId = 3;
+    private const uint DozeEmoteRowId = 13;
+    private const uint ChairSitEmoteRowId = 50;
+    private const uint GroundSitEmoteModeRowId = 1;
+    private const uint ChairSitEmoteModeRowId = 2;
+
+    // Hidden emote ids the game uses internally for furniture interactions —
+    // executing them plays sit/doze without requiring a chair/bed.
+    private const uint SitAnywhereEmoteId = 96;
+    private const uint DozeAnywhereEmoteId = 99;
 
     private readonly Dictionary<string, uint> iconCache = new(System.StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> nameToCommand = new(System.StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> expressionCommands = new(System.StringComparer.OrdinalIgnoreCase);
+    // Command (any variant) -> EmoteController.PoseType value for pose-mode emotes (sit/groundsit/doze)
+    private readonly Dictionary<string, byte> poseTypeCommands = new(System.StringComparer.OrdinalIgnoreCase);
+    // Command (any variant) -> hidden "anywhere" emote id (chair sit and doze only)
+    private readonly Dictionary<string, uint> anywhereCommands = new(System.StringComparer.OrdinalIgnoreCase);
+    // EmoteController.PoseType value -> (main command, emote name), for building rows from pose files
+    private readonly Dictionary<byte, (string Command, string Name)> poseTypeInfo = new();
     private readonly ITextureProvider textureProvider;
 
     public EmoteIconHelper(ITextureProvider textureProvider, IDataManager dataManager)
@@ -33,6 +48,18 @@ public class EmoteIconHelper
             var textCommand = emote.TextCommand.ValueNullable;
             if (textCommand == null) continue;
 
+            // EmoteController.PoseType values: Sit = 2, GroundSit = 3, Doze = 4.
+            // Chair sit (/lounge, alias /sit) and ground sit are flagged via EmoteMode;
+            // Doze has no EmoteMode in the sheet and is matched by its row id.
+            byte? poseType = emote.RowId == DozeEmoteRowId ? (byte)4
+                : emote.EmoteMode.RowId == ChairSitEmoteModeRowId ? (byte)2
+                : emote.EmoteMode.RowId == GroundSitEmoteModeRowId ? (byte)3
+                : null;
+
+            uint? anywhereId = emote.RowId == DozeEmoteRowId ? DozeAnywhereEmoteId
+                : emote.RowId == ChairSitEmoteRowId ? SitAnywhereEmoteId
+                : null;
+
             var cmd = textCommand.Value.Command.ExtractText();
             if (!string.IsNullOrEmpty(cmd))
             {
@@ -44,20 +71,59 @@ public class EmoteIconHelper
 
                 if (emote.EmoteCategory.RowId == ExpressionsCategoryRowId)
                     expressionCommands.Add(cmd);
+
+                if (poseType != null)
+                    poseTypeInfo.TryAdd(poseType.Value, (cmd, emoteName));
             }
 
             var alias = textCommand.Value.Alias.ExtractText();
-            if (!string.IsNullOrEmpty(alias))
-                iconCache.TryAdd(alias, emote.Icon);
-
             var shortCmd = textCommand.Value.ShortCommand.ExtractText();
-            if (!string.IsNullOrEmpty(shortCmd))
-                iconCache.TryAdd(shortCmd, emote.Icon);
-
             var shortAlias = textCommand.Value.ShortAlias.ExtractText();
-            if (!string.IsNullOrEmpty(shortAlias))
-                iconCache.TryAdd(shortAlias, emote.Icon);
+
+            foreach (var variant in new[] { cmd, alias, shortCmd, shortAlias })
+            {
+                if (string.IsNullOrEmpty(variant))
+                    continue;
+
+                iconCache.TryAdd(variant, emote.Icon);
+                if (poseType != null)
+                    poseTypeCommands.TryAdd(variant, poseType.Value);
+                if (anywhereId != null)
+                    anywhereCommands.TryAdd(variant, anywhereId.Value);
+            }
         }
+    }
+
+    /// <summary>
+    /// The EmoteController.PoseType this command selects a pose for (sit/groundsit/doze),
+    /// or null when the command is not a pose-mode emote.
+    /// </summary>
+    public byte? GetPoseType(string command)
+    {
+        var cmd = NormalizeCommand(command);
+        return cmd != null && poseTypeCommands.TryGetValue(cmd, out var poseType) ? poseType : null;
+    }
+
+    /// <summary> The main command and emote name for a pose type (sit/groundsit/doze). </summary>
+    public (string Command, string Name)? GetPoseTypeInfo(byte poseType)
+        => poseTypeInfo.TryGetValue(poseType, out var info) ? info : null;
+
+    /// <summary>
+    /// The hidden "anywhere" emote id for this command (chair sit / doze),
+    /// or null when the command has no anywhere variant.
+    /// </summary>
+    public uint? GetAnywhereEmoteId(string command)
+    {
+        var cmd = NormalizeCommand(command);
+        return cmd != null && anywhereCommands.TryGetValue(cmd, out var emoteId) ? emoteId : null;
+    }
+
+    private static string? NormalizeCommand(string command)
+    {
+        var cmd = command.Trim();
+        if (string.IsNullOrEmpty(cmd))
+            return null;
+        return cmd.StartsWith('/') ? cmd : "/" + cmd;
     }
 
     /// <summary>

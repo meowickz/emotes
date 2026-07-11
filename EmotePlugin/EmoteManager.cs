@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Newtonsoft.Json;
 
 namespace EmotePlugin;
@@ -14,20 +16,37 @@ public class EmoteSetExport
     public EmoteFolder Root { get; set; } = new();
 }
 
-public class EmoteManager
+public class EmoteManager : IDisposable
 {
     private readonly Configuration configuration;
     private readonly PenumbraService penumbraService;
+    private readonly EmoteIconHelper emoteData;
+    private readonly IFramework framework;
+    private readonly IObjectTable objectTable;
     private readonly IPluginLog log;
 
     private EmoteEntry? lastUsedEmote;
     private string? lastUsedCommand;
 
-    public EmoteManager(Configuration configuration, PenumbraService penumbraService, IPluginLog log)
+    // A pose change waiting for the character to enter the right stance
+    private (byte PoseType, byte TargetIndex, DateTime Deadline)? pendingPose;
+
+    public EmoteManager(Configuration configuration, PenumbraService penumbraService, EmoteIconHelper emoteData,
+        IFramework framework, IObjectTable objectTable, IPluginLog log)
     {
         this.configuration = configuration;
         this.penumbraService = penumbraService;
+        this.emoteData = emoteData;
+        this.framework = framework;
+        this.objectTable = objectTable;
         this.log = log;
+
+        framework.Update += OnFrameworkUpdate;
+    }
+
+    public void Dispose()
+    {
+        framework.Update -= OnFrameworkUpdate;
     }
 
     public EmoteFolder GetRootFolder() => configuration.RootFolder;
@@ -150,13 +169,101 @@ public class EmoteManager
             }
         }
 
-        // Send the emote command via chat
-        var command = cmd.Command;
-        if (!command.StartsWith('/'))
-            command = "/" + command;
+        var poseType = cmd.PoseIndex > 0 ? emoteData.GetPoseType(cmd.Command) : null;
 
-        SendChatCommand(command);
-        log.Information($"Used emote: {emote.Name} ({command})");
+        // Already in the target stance: only switch the pose — re-sending the
+        // emote command would cancel the emote (e.g. /doze while dozing stands up).
+        if (poseType != null && GetLocalPoseState()?.PoseType == poseType.Value)
+        {
+            QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
+            log.Information($"Used emote: {emote.Name} (pose change to {cmd.PoseIndex})");
+            return;
+        }
+
+        // With Sit/Doze Anywhere enabled, execute the game's hidden furniture emote
+        // instead of the chat command, so sit/doze work without a chair or bed nearby.
+        var anywhereId = configuration.SitDozeAnywhere ? emoteData.GetAnywhereEmoteId(cmd.Command) : null;
+        if (anywhereId != null)
+        {
+            ExecuteHotbarEmote(anywhereId.Value);
+            log.Information($"Used emote: {emote.Name} (anywhere emote {anywhereId.Value})");
+        }
+        else
+        {
+            // Send the emote command via chat
+            var command = cmd.Command;
+            if (!command.StartsWith('/'))
+                command = "/" + command;
+
+            SendChatCommand(command);
+            log.Information($"Used emote: {emote.Name} ({command})");
+        }
+
+        // Once the stance is entered, cycle /cpose to the requested pose
+        if (poseType != null)
+            QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
+    }
+
+    /// <summary> Execute an emote by id through the hotbar module's scratch slot. </summary>
+    private static unsafe void ExecuteHotbarEmote(uint emoteId)
+    {
+        var hotbarModule = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()
+            ->UIModule->GetRaptureHotbarModule();
+        if (hotbarModule == null)
+            return;
+
+        hotbarModule->ScratchSlot.Set(RaptureHotbarModule.HotbarSlotType.Emote, emoteId);
+        hotbarModule->ExecuteSlot(&hotbarModule->ScratchSlot);
+        hotbarModule->ScratchSlot.Set(RaptureHotbarModule.HotbarSlotType.Empty, 0);
+    }
+
+    private void QueuePoseChange(byte poseType, byte targetIndex)
+        => pendingPose = (poseType, targetIndex, DateTime.UtcNow.AddSeconds(5));
+
+    /// <summary> The local player's current pose stance and pose index, or null when unavailable. </summary>
+    private unsafe (byte PoseType, byte PoseIndex)? GetLocalPoseState()
+    {
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero)
+            return null;
+
+        var chara = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
+        return ((byte)chara->EmoteController.CurrentPoseType, chara->EmoteController.CPoseState);
+    }
+
+    /// <summary>
+    /// Applies a queued pose change once the character has entered the target stance:
+    /// sends /cpose the exact number of times needed to land on the requested pose
+    /// (the approach used by pose plugins — the game offers no direct set).
+    /// </summary>
+    private void OnFrameworkUpdate(IFramework _)
+    {
+        if (pendingPose == null)
+            return;
+
+        var (poseType, targetIndex, deadline) = pendingPose.Value;
+        if (DateTime.UtcNow > deadline)
+        {
+            pendingPose = null;
+            return;
+        }
+
+        var state = GetLocalPoseState();
+        if (state == null || state.Value.PoseType != poseType)
+            return; // stance not entered yet — keep waiting until the deadline
+
+        // Per Poser: GetAvailablePoses returns the highest valid pose index
+        var totalPoses = EmoteController.GetAvailablePoses((EmoteController.PoseType)poseType) + 1;
+        var current = state.Value.PoseIndex;
+        var target = Math.Min(targetIndex, totalPoses - 1);
+
+        var steps = ((target - current) % totalPoses + totalPoses) % totalPoses;
+        for (var i = 0; i < steps; i++)
+            SendChatCommand("/cpose");
+
+        if (steps > 0)
+            log.Debug($"Cycled /cpose {steps}x to pose {target + 1} (type {poseType}).");
+        pendingPose = null;
     }
 
     private static unsafe void SendChatCommand(string command)
@@ -364,9 +471,23 @@ public class EmoteManager
         Configuration.MigrateAllCommands(importedRoot);
         RegenerateIds(importedRoot);
         ClearDuplicateAliases(importedRoot);
-        configuration.RootFolder.Emotes.AddRange(importedRoot.Emotes);
-        configuration.RootFolder.Folders.AddRange(importedRoot.Folders);
+        MergeInto(configuration.RootFolder, importedRoot);
         configuration.Save();
+    }
+
+    /// <summary> Merge the source tree into the target, combining same-named folders (case-insensitive). </summary>
+    private static void MergeInto(EmoteFolder target, EmoteFolder source)
+    {
+        target.Emotes.AddRange(source.Emotes);
+        foreach (var sub in source.Folders)
+        {
+            var existing = target.Folders.FirstOrDefault(
+                f => f.Name.Equals(sub.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing != null)
+                MergeInto(existing, sub);
+            else
+                target.Folders.Add(sub);
+        }
     }
 
     /// <summary>
@@ -393,6 +514,7 @@ public class EmoteManager
                 cmd.Name ??= string.Empty;
                 cmd.Command ??= string.Empty;
                 cmd.Alias ??= string.Empty;
+                cmd.PoseIndex = Math.Clamp(cmd.PoseIndex, 0, 9);
             }
 
             emote.AssociatedMods ??= new List<ModAssociation>();

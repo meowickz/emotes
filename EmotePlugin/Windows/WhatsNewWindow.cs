@@ -9,6 +9,14 @@ public class WhatsNewWindow : Window, IDisposable
 {
     private static readonly (string Version, string[] Changes)[] Changelog =
     {
+        ("1.2.0.0", new[]
+        {
+            "Pose selection: sit, ground sit and doze commands can specify a /cpose pose number and land directly in that pose — playing the row again while already sitting/dozing switches the pose in place.",
+            "Detect from mods now also reads which pose slots a mod replaces and adds pose-ready command rows (e.g. \"Doze Pose 3\").",
+            "Sit/Doze Anywhere: optional setting to play /sit and /doze without a chair or bed, using the game's hidden furniture emote.",
+            "Import is now selective: tick/untick individual emotes in a combined review table (mods, remapping and folder location shown per emote).",
+            "Importing folders with names you already have merges them instead of creating duplicates.",
+        }),
         ("1.1.0.0", new[]
         {
             "Emotes can now hold multiple commands, each with its own name, alias, enabled toggle and a default marker. Reorder them with the arrow buttons.",

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.RegularExpressions;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
@@ -80,6 +81,10 @@ public class MainWindow : Window, IDisposable
     private readonly FileDialogManager fileDialog = new();
     private EmoteFolder? pendingImport;
     private readonly List<ImportModRow> pendingImportMods = new();
+    private readonly List<(EmoteEntry Emote, string Path)> pendingImportEmotes = new();
+    private readonly Dictionary<Guid, List<ImportModRow>> pendingRowsByEmote = new();
+    private readonly HashSet<Guid> importSelectedEmotes = new();
+    private static readonly List<ImportModRow> EmptyImportRows = new();
     private bool importPopupPending;
     private string importError = string.Empty;
     private string importModSearch = string.Empty;
@@ -226,6 +231,26 @@ public class MainWindow : Window, IDisposable
             plugin.Configuration.Save();
         }
 
+        var sitDozeAnywhere = plugin.Configuration.SitDozeAnywhere;
+        if (ImGui.Checkbox("Sit/Doze Anywhere", ref sitDozeAnywhere))
+        {
+            plugin.Configuration.SitDozeAnywhere = sitDozeAnywhere;
+            plugin.Configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Play /sit and /doze commands using the game's hidden furniture emote,\nso they work without a chair or bed nearby.");
+
+        if (sitDozeAnywhere)
+        {
+            ImGui.SameLine();
+            ImGui.AlignTextToFramePadding();
+            ImGui.PushFont(UiBuilder.IconFont);
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.2f, 1f), FontAwesomeIcon.ExclamationTriangle.ToIconString());
+            ImGui.PopFont();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Other players see this non-standard behavior (sitting in mid-air,\ndozing on bare ground). Use with discretion in public areas.");
+        }
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
@@ -267,7 +292,12 @@ public class MainWindow : Window, IDisposable
 
                     pendingImport = root;
                     pendingImportMods.Clear();
-                    CollectImportMods(root);
+                    pendingImportEmotes.Clear();
+                    pendingRowsByEmote.Clear();
+                    CollectImportEntries(root, string.Empty);
+                    importSelectedEmotes.Clear();
+                    foreach (var (importEmote, _) in pendingImportEmotes)
+                        importSelectedEmotes.Add(importEmote.Id);
                     importModSearch = string.Empty;
                     importPopupPending = true;
                     lastCacheRefresh = 0; // refresh mod/collection lists for the review dialog
@@ -293,19 +323,30 @@ public class MainWindow : Window, IDisposable
     private static int CountEmotes(EmoteFolder folder)
         => folder.Emotes.Count + folder.Folders.Sum(CountEmotes);
 
-    private void CollectImportMods(EmoteFolder folder)
+    private void CollectImportEntries(EmoteFolder folder, string path)
     {
-        foreach (var emote in folder.EnumerateEmotes())
-        foreach (var mod in emote.AssociatedMods)
+        foreach (var emote in folder.Emotes)
         {
-            pendingImportMods.Add(new ImportModRow
+            pendingImportEmotes.Add((emote, path));
+            foreach (var mod in emote.AssociatedMods)
             {
-                Emote = emote,
-                Mod = mod,
-                MapDir = mod.ModDirectory ?? string.Empty,
-                MapName = mod.ModName ?? string.Empty,
-            });
+                var row = new ImportModRow
+                {
+                    Emote = emote,
+                    Mod = mod,
+                    MapDir = mod.ModDirectory ?? string.Empty,
+                    MapName = mod.ModName ?? string.Empty,
+                };
+                pendingImportMods.Add(row);
+
+                if (!pendingRowsByEmote.TryGetValue(emote.Id, out var list))
+                    pendingRowsByEmote[emote.Id] = list = new List<ImportModRow>();
+                list.Add(row);
+            }
         }
+
+        foreach (var sub in folder.Folders)
+            CollectImportEntries(sub, path.Length == 0 ? sub.Name : $"{path}/{sub.Name}");
     }
 
     private void DrawImportPopup()
@@ -326,141 +367,198 @@ public class MainWindow : Window, IDisposable
             // The popup should be open whenever an import is pending; if it isn't,
             // it was dismissed (Escape closes modals without writing `open`) —
             // discard the pending import instead of leaving it orphaned.
-            pendingImport = null;
-            pendingImportMods.Clear();
+            ClearPendingImport();
             return;
         }
 
-        ImGui.Text($"Importing {CountEmotes(pendingImport)} emote(s).");
+        ImGui.Text($"Importing {importSelectedEmotes.Count} of {pendingImportEmotes.Count} emote(s). Same-named folders are merged.");
+        ImGui.TextWrapped("Untick emotes you don't want. Mods missing from your Penumbra installation are " +
+                          "highlighted — remap them to an installed mod, keep them as-is, or drop them.");
 
-        if (pendingImportMods.Count > 0)
+        if (ImGui.SmallButton("Select All"))
         {
-            ImGui.TextWrapped("Review the associated mods below. Mods missing from your Penumbra installation " +
-                              "are highlighted — remap them to an installed mod, keep them as-is, or drop them.");
-            ImGui.Spacing();
-
-            var footerHeight = ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y;
-            using (var child = ImRaii.Child("##ImportModList", new Vector2(-1, -footerHeight), true))
-            {
-                if (child.Success)
-                    DrawImportModTable();
-            }
+            foreach (var (importEmote, _) in pendingImportEmotes)
+                importSelectedEmotes.Add(importEmote.Id);
         }
-        else
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select None"))
+            importSelectedEmotes.Clear();
+
+        ImGui.Spacing();
+
+        var footerHeight = ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y;
+        using (var child = ImRaii.Child("##ImportReview", new Vector2(-1, -footerHeight), true))
         {
-            ImGui.TextDisabled("No associated mods to review.");
-            ImGui.Spacing();
+            if (child.Success)
+                DrawImportTable();
         }
 
+        ImGui.BeginDisabled(importSelectedEmotes.Count == 0);
         if (ImGui.Button("Import", new Vector2(120, 0)))
         {
             ApplyImport();
             ImGui.CloseCurrentPopup();
         }
+        ImGui.EndDisabled();
 
         ImGui.SameLine();
         if (ImGui.Button("Cancel", new Vector2(120, 0)))
         {
-            pendingImport = null;
-            pendingImportMods.Clear();
+            ClearPendingImport();
             ImGui.CloseCurrentPopup();
         }
 
         ImGui.EndPopup();
 
         if (!open)
-        {
-            pendingImport = null;
-            pendingImportMods.Clear();
-        }
+            ClearPendingImport();
     }
 
-    private void DrawImportModTable()
+    private void ClearPendingImport()
     {
-        if (!ImGui.BeginTable("##ImportModTable", 3,
+        pendingImport = null;
+        pendingImportMods.Clear();
+        pendingImportEmotes.Clear();
+        pendingRowsByEmote.Clear();
+        importSelectedEmotes.Clear();
+    }
+
+    private void DrawImportTable()
+    {
+        if (!ImGui.BeginTable("##ImportTable", 4,
                 ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
             return;
 
+        ImGui.TableSetupColumn("##Sel", ImGuiTableColumnFlags.WidthFixed, ImGui.GetFrameHeight() + 4);
         ImGui.TableSetupColumn("Emote", ImGuiTableColumnFlags.WidthStretch, 0.35f);
         ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 60);
         ImGui.TableSetupColumn("Mod", ImGuiTableColumnFlags.WidthStretch, 0.65f);
         ImGui.TableHeadersRow();
 
-        for (var i = 0; i < pendingImportMods.Count; i++)
+        var rowId = 0;
+        foreach (var (emote, path) in pendingImportEmotes)
         {
-            var row = pendingImportMods[i];
+            var rows = pendingRowsByEmote.TryGetValue(emote.Id, out var list) ? list : EmptyImportRows;
+            var selected = importSelectedEmotes.Contains(emote.Id);
+
             ImGui.TableNextRow();
-            ImGui.PushID(i);
+            ImGui.PushID(rowId++);
 
+            // Include checkbox
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
-            ImGui.Text(row.Emote.Name);
-
-            var mappedFound = cachedMods.ContainsKey(row.MapDir);
-
-            ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
-            if (row.Remove)
-                ImGui.TextDisabled("Dropped");
-            else if (!penumbraService.Available)
-                ImGui.TextColored(new Vector4(1, 1, 0.4f, 1), "Unknown");
-            else if (mappedFound)
-                ImGui.TextColored(new Vector4(0, 1, 0, 1), "Found");
-            else
-                ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "Missing");
-
-            ImGui.TableNextColumn();
-            var preview = row.Remove
-                ? "(Don't import this mod)"
-                : string.IsNullOrWhiteSpace(row.MapName) ? row.MapDir : row.MapName;
-
-            ImGui.SetNextItemWidth(-1);
-            var comboWidth = ImGui.GetContentRegionAvail().X;
-            ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 400));
-            if (ImGui.BeginCombo("##ImportModSelect", preview))
+            if (ImGui.Checkbox("##sel", ref selected))
             {
-                ImGui.SetNextItemWidth(-1);
-                ImGui.InputTextWithHint("##ImportModSearch", "Search mods...", ref importModSearch, 128);
-
-                var originalLabel = row.Mod.DisplayName;
-                if (ImGui.Selectable($"(Keep original: {originalLabel})",
-                        !row.Remove && string.Equals(row.MapDir, row.Mod.ModDirectory, StringComparison.OrdinalIgnoreCase)))
-                {
-                    row.MapDir = row.Mod.ModDirectory;
-                    row.MapName = row.Mod.ModName;
-                    row.Remove = false;
-                }
-
-                if (ImGui.Selectable("(Don't import this mod)", row.Remove))
-                    row.Remove = true;
-
-                ImGui.Separator();
-
-                foreach (var (dir, name) in cachedMods)
-                {
-                    if (!string.IsNullOrWhiteSpace(importModSearch) &&
-                        !dir.Contains(importModSearch, StringComparison.OrdinalIgnoreCase) &&
-                        !name.Contains(importModSearch, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var label = string.IsNullOrWhiteSpace(name) ? dir : name;
-                    if (ImGui.Selectable($"{label}##{dir}",
-                            !row.Remove && string.Equals(row.MapDir, dir, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        row.MapDir = dir;
-                        row.MapName = name;
-                        row.Remove = false;
-                        importModSearch = string.Empty;
-                    }
-                }
-
-                ImGui.EndCombo();
+                if (selected)
+                    importSelectedEmotes.Add(emote.Id);
+                else
+                    importSelectedEmotes.Remove(emote.Id);
             }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Import this emote");
 
+            // Emote name with dimmed folder path
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            if (path.Length > 0)
+            {
+                ImGui.TextDisabled(path + "/");
+                ImGui.SameLine(0, 0);
+            }
+            ImGui.Text(emote.Name.Length == 0 ? "(unnamed)" : emote.Name);
+
+            ImGui.BeginDisabled(!selected);
+            if (rows.Count == 0)
+            {
+                ImGui.TableNextColumn();
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled("(no mods)");
+            }
+            else
+            {
+                DrawImportModCells(rows[0]);
+            }
+            ImGui.EndDisabled();
             ImGui.PopID();
+
+            // One extra row per additional associated mod
+            for (var i = 1; i < rows.Count; i++)
+            {
+                ImGui.TableNextRow();
+                ImGui.PushID(rowId++);
+                ImGui.TableNextColumn();
+                ImGui.TableNextColumn();
+                ImGui.BeginDisabled(!selected);
+                DrawImportModCells(rows[i]);
+                ImGui.EndDisabled();
+                ImGui.PopID();
+            }
         }
 
         ImGui.EndTable();
+    }
+
+    private void DrawImportModCells(ImportModRow row)
+    {
+        var mappedFound = cachedMods.ContainsKey(row.MapDir);
+
+        ImGui.TableNextColumn();
+        ImGui.AlignTextToFramePadding();
+        if (row.Remove)
+            ImGui.TextDisabled("Dropped");
+        else if (!penumbraService.Available)
+            ImGui.TextColored(new Vector4(1, 1, 0.4f, 1), "Unknown");
+        else if (mappedFound)
+            ImGui.TextColored(new Vector4(0, 1, 0, 1), "Found");
+        else
+            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "Missing");
+
+        ImGui.TableNextColumn();
+        var preview = row.Remove
+            ? "(Don't import this mod)"
+            : string.IsNullOrWhiteSpace(row.MapName) ? row.MapDir : row.MapName;
+
+        ImGui.SetNextItemWidth(-1);
+        var comboWidth = ImGui.GetContentRegionAvail().X;
+        ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 400));
+        if (ImGui.BeginCombo("##ImportModSelect", preview))
+        {
+            ImGui.SetNextItemWidth(-1);
+            ImGui.InputTextWithHint("##ImportModSearch", "Search mods...", ref importModSearch, 128);
+
+            var originalLabel = row.Mod.DisplayName;
+            if (ImGui.Selectable($"(Keep original: {originalLabel})",
+                    !row.Remove && string.Equals(row.MapDir, row.Mod.ModDirectory, StringComparison.OrdinalIgnoreCase)))
+            {
+                row.MapDir = row.Mod.ModDirectory;
+                row.MapName = row.Mod.ModName;
+                row.Remove = false;
+            }
+
+            if (ImGui.Selectable("(Don't import this mod)", row.Remove))
+                row.Remove = true;
+
+            ImGui.Separator();
+
+            foreach (var (dir, name) in cachedMods)
+            {
+                if (!string.IsNullOrWhiteSpace(importModSearch) &&
+                    !dir.Contains(importModSearch, StringComparison.OrdinalIgnoreCase) &&
+                    !name.Contains(importModSearch, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var label = string.IsNullOrWhiteSpace(name) ? dir : name;
+                if (ImGui.Selectable($"{label}##{dir}",
+                        !row.Remove && string.Equals(row.MapDir, dir, StringComparison.OrdinalIgnoreCase)))
+                {
+                    row.MapDir = dir;
+                    row.MapName = name;
+                    row.Remove = false;
+                    importModSearch = string.Empty;
+                }
+            }
+
+            ImGui.EndCombo();
+        }
     }
 
     private void ApplyImport()
@@ -468,8 +566,13 @@ public class MainWindow : Window, IDisposable
         if (pendingImport == null)
             return;
 
+        PruneUnselectedEmotes(pendingImport);
+
         foreach (var row in pendingImportMods)
         {
+            if (!importSelectedEmotes.Contains(row.Emote.Id))
+                continue;
+
             if (row.Remove)
             {
                 row.Emote.AssociatedMods.Remove(row.Mod);
@@ -500,8 +603,17 @@ public class MainWindow : Window, IDisposable
 
         emoteManager.ImportEmotes(pendingImport);
 
-        pendingImport = null;
-        pendingImportMods.Clear();
+        ClearPendingImport();
+    }
+
+    private void PruneUnselectedEmotes(EmoteFolder folder)
+    {
+        folder.Emotes.RemoveAll(e => !importSelectedEmotes.Contains(e.Id));
+        foreach (var sub in folder.Folders)
+            PruneUnselectedEmotes(sub);
+
+        // Drop folders that end up with nothing to import
+        folder.Folders.RemoveAll(f => !f.EnumerateEmotes().Any());
     }
 
     private void ResetUnknownCollections(EmoteFolder folder)
@@ -1355,6 +1467,11 @@ public class MainWindow : Window, IDisposable
         ImGui.PopStyleColor();
     }
 
+    // cpose variant animation files: emote/pose0N = stand, s_ = chair sit, j_ = ground sit, l_ = doze
+    private static readonly Regex PoseFileRegex = new(
+        @"emote/(s_|j_|l_)pose(\d{2})_(?:loop|start)\.pap",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private void DetectCommandsFromMods(EmoteEntry emote)
     {
         if (emote.AssociatedMods.Count == 0)
@@ -1369,29 +1486,39 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
-        // command -> resolved emote display name, deduplicated across all associated mods
-        var detected = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // (command, 1-based pose or 0 for generic) -> display name, deduplicated across mods
+        var detected = new Dictionary<(string Command, int Pose), string>();
         foreach (var mod in emote.AssociatedMods)
         {
             foreach (var itemName in penumbraService.GetChangedItems(mod.ModDirectory, mod.ModName).Keys)
             {
                 var resolved = emoteIconHelper.ResolveEmote(itemName);
                 if (resolved != null)
-                    detected.TryAdd(resolved.Value.Command, resolved.Value.Name);
+                    detected.TryAdd((resolved.Value.Command, 0), resolved.Value.Name);
                 else
                     Plugin.Log.Debug($"Changed item '{itemName}' in '{mod.ModDirectory}' did not resolve to an emote command.");
             }
         }
 
+        DetectPoseFiles(emote, detected);
+
+        // A pose-specific row supersedes the generic row for the same command
+        var poseCommands = new HashSet<string>(
+            detected.Keys.Where(k => k.Pose > 0).Select(k => k.Command), StringComparer.OrdinalIgnoreCase);
+        foreach (var key in detected.Keys.Where(k => k.Pose == 0 && poseCommands.Contains(k.Command)).ToList())
+            detected.Remove(key);
+
         var added = 0;
-        // Normal emotes first, facial expressions after
-        foreach (var (command, name) in detected.OrderBy(kv => emoteIconHelper.IsExpressionCommand(kv.Key) ? 1 : 0))
+        // Normal emotes first, facial expressions after; pose variants in ascending order
+        foreach (var ((command, pose), name) in detected
+                     .OrderBy(kv => emoteIconHelper.IsExpressionCommand(kv.Key.Command) ? 1 : 0)
+                     .ThenBy(kv => kv.Key.Pose))
         {
-            if (emote.Commands.Any(c => c.Command.TrimStart('/').Equals(
+            if (emote.Commands.Any(c => c.PoseIndex == pose && c.Command.TrimStart('/').Equals(
                     command.TrimStart('/'), StringComparison.OrdinalIgnoreCase)))
                 continue;
 
-            var row = new EmoteCommandEntry { Name = name, Command = command };
+            var row = new EmoteCommandEntry { Name = name, Command = command, PoseIndex = pose };
             emote.Commands.Add(row);
             added++;
         }
@@ -1410,10 +1537,66 @@ public class MainWindow : Window, IDisposable
                 : "No emote changes found in associated mods.");
     }
 
+    /// <summary>
+    /// Scan the associated mods' option files on disk for cpose variant animations
+    /// (e.g. emote/l_pose02_loop.pap = doze pose 3) and add pose-specific entries.
+    /// </summary>
+    private void DetectPoseFiles(EmoteEntry emote, Dictionary<(string Command, int Pose), string> detected)
+    {
+        var modRoot = penumbraService.GetModRootDirectory();
+        if (string.IsNullOrEmpty(modRoot))
+            return;
+
+        foreach (var mod in emote.AssociatedMods)
+        {
+            var modDir = Path.Combine(modRoot, mod.ModDirectory);
+            if (!Directory.Exists(modDir))
+                continue;
+
+            // Penumbra option files (default_mod.json, group_*.json) list replaced game paths
+            foreach (var jsonFile in Directory.EnumerateFiles(modDir, "*.json", SearchOption.TopDirectoryOnly))
+            {
+                string text;
+                try
+                {
+                    text = File.ReadAllText(jsonFile);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (Match match in PoseFileRegex.Matches(text))
+                {
+                    byte poseType = match.Groups[1].Value.ToLowerInvariant() switch
+                    {
+                        "s_" => 2, // chair sit
+                        "j_" => 3, // ground sit
+                        "l_" => 4, // doze
+                        _ => 0,
+                    };
+                    if (poseType == 0)
+                        continue;
+
+                    var info = emoteIconHelper.GetPoseTypeInfo(poseType);
+                    if (info == null)
+                        continue;
+
+                    // File pose0N replaces cpose index N; our PoseIndex is 1-based
+                    if (!int.TryParse(match.Groups[2].Value, out var fileIndex))
+                        continue;
+
+                    var pose = fileIndex + 1;
+                    detected.TryAdd((info.Value.Command, pose), $"{info.Value.Name} Pose {pose}");
+                }
+            }
+        }
+    }
+
     private void DrawCommandTable(EmoteEntry emote)
     {
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX;
-        if (ImGui.BeginTable("##CommandTable", 6, flags))
+        if (ImGui.BeginTable("##CommandTable", 7, flags))
         {
             var checkWidth = ImGui.GetFrameHeight() + 4;
             ImGui.TableSetupColumn("##On", ImGuiTableColumnFlags.WidthFixed, checkWidth);
@@ -1421,6 +1604,7 @@ public class MainWindow : Window, IDisposable
             ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch, 0.30f);
             ImGui.TableSetupColumn("Command", ImGuiTableColumnFlags.WidthStretch, 0.40f);
             ImGui.TableSetupColumn("Alias", ImGuiTableColumnFlags.WidthStretch, 0.30f);
+            ImGui.TableSetupColumn("Pose", ImGuiTableColumnFlags.WidthFixed, 44);
             ImGui.TableSetupColumn("##CmdActions", ImGuiTableColumnFlags.WidthFixed, 104);
             ImGui.TableHeadersRow();
 
@@ -1485,6 +1669,26 @@ public class MainWindow : Window, IDisposable
                 }
                 if (ImGui.IsItemHovered() && !string.IsNullOrWhiteSpace(cmd.Alias))
                     ImGui.SetTooltip($"/emotes {cmd.Alias}");
+
+                // Pose selector — only for pose-mode emotes (sit/groundsit/doze)
+                ImGui.TableNextColumn();
+                if (emoteIconHelper.GetPoseType(cmd.Command) != null)
+                {
+                    var pose = cmd.PoseIndex;
+                    ImGui.SetNextItemWidth(-1);
+                    if (ImGui.InputInt("##cmdPose", ref pose, 0, 0))
+                    {
+                        cmd.PoseIndex = Math.Clamp(pose, 0, 9);
+                        emoteManager.UpdateEmote(emote);
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Pose number (as cycled by /cpose) to start this emote in.\n0 = keep the current pose selection.");
+                }
+                else
+                {
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.TextDisabled("-");
+                }
 
                 // Actions
                 ImGui.TableNextColumn();
