@@ -170,9 +170,11 @@ public class QuickAccessWindow : Window, IDisposable
         // Combo with filter; pin the popup to the combo width so it doesn't open wide and shrink
         ImGui.SetNextItemWidth(comboWidth);
         ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 300f));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
         if (ImGui.BeginCombo("##QuickEmoteSelect", selected.Label))
         {
-            // Filter input
+            // Filter pinned above the scrolling list — flush and square (Glamourer-style)
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0f);
             ImGui.SetNextItemWidth(-1);
             if (!comboOpen)
             {
@@ -180,31 +182,40 @@ public class QuickAccessWindow : Window, IDisposable
                 comboOpen = true;
             }
             ImGui.InputTextWithHint("##QuickFilter", "Filter...", ref filterQuery, 256);
+            ImGui.PopStyleVar();
 
-            for (var i = 0; i < items.Count; i++)
+            if (ImGui.BeginChild("##QuickItems", new Vector2(-1, 240)))
             {
-                var item = items[i];
-
-                if (!string.IsNullOrEmpty(filterQuery) && !MatchesFilter(item))
-                    continue;
-
-                var isSelected = i == selectedIndex;
-                if (ImGui.Selectable($"{item.Label}##{i}", isSelected))
+                for (var i = 0; i < items.Count; i++)
                 {
-                    SetSelected(item);
-                    filterQuery = string.Empty;
-                }
+                    var item = items[i];
 
-                if (isSelected)
-                    ImGui.SetItemDefaultFocus();
+                    if (!string.IsNullOrEmpty(filterQuery) && !MatchesFilter(item))
+                        continue;
+
+                    var isSelected = i == selectedIndex;
+                    if (ImGui.Selectable($"{item.Label}##{i}", isSelected))
+                    {
+                        SetSelected(item);
+                        filterQuery = string.Empty;
+                        // Selectables inside a child window don't auto-close the popup
+                        ImGui.CloseCurrentPopup();
+                    }
+
+                    if (isSelected)
+                        ImGui.SetItemDefaultFocus();
+                }
             }
 
+            ImGui.EndChild();
             ImGui.EndCombo();
         }
         else
         {
             comboOpen = false;
         }
+
+        ImGui.PopStyleVar();
 
         // Mouse wheel over the closed combo cycles the selection.
         // Accumulate fractional deltas so precision touchpads/free-spin wheels work.

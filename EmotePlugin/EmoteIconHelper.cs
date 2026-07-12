@@ -12,6 +12,7 @@ public class EmoteIconHelper
     private const uint ExpressionsCategoryRowId = 3;
     private const uint DozeEmoteRowId = 13;
     private const uint ChairSitEmoteRowId = 50;
+    private const uint ChangePoseEmoteRowId = 90;
     private const uint GroundSitEmoteModeRowId = 1;
     private const uint ChairSitEmoteModeRowId = 2;
 
@@ -29,6 +30,10 @@ public class EmoteIconHelper
     private readonly Dictionary<string, uint> anywhereCommands = new(System.StringComparer.OrdinalIgnoreCase);
     // EmoteController.PoseType value -> (main command, emote name), for building rows from pose files
     private readonly Dictionary<byte, (string Command, string Name)> poseTypeInfo = new();
+    // Command (any variant) -> the emote's primary ActionTimeline id, for local previews
+    private readonly Dictionary<string, ushort> commandTimelines = new(System.StringComparer.OrdinalIgnoreCase);
+    // ActionTimeline key (e.g. "emote/l_pose02_loop") -> row id, for pose-variant previews
+    private readonly Dictionary<string, ushort> poseLoopTimelines = new(System.StringComparer.OrdinalIgnoreCase);
     private readonly ITextureProvider textureProvider;
 
     public EmoteIconHelper(ITextureProvider textureProvider, IDataManager dataManager)
@@ -39,6 +44,20 @@ public class EmoteIconHelper
 
     private void BuildCache(IDataManager dataManager)
     {
+        // Pose-variant loop timelines (emote/pose01_loop, emote/l_pose02_loop, ...)
+        var timelineSheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.ActionTimeline>();
+        if (timelineSheet != null)
+        {
+            foreach (var timeline in timelineSheet)
+            {
+                var key = timeline.Key.ExtractText();
+                if (key.StartsWith("emote/", System.StringComparison.Ordinal) &&
+                    key.EndsWith("_loop", System.StringComparison.Ordinal) &&
+                    key.Contains("pose", System.StringComparison.Ordinal))
+                    poseLoopTimelines.TryAdd(key, (ushort)timeline.RowId);
+            }
+        }
+
         var emoteSheet = dataManager.GetExcelSheet<Emote>();
         if (emoteSheet == null) return;
 
@@ -48,10 +67,12 @@ public class EmoteIconHelper
             var textCommand = emote.TextCommand.ValueNullable;
             if (textCommand == null) continue;
 
-            // EmoteController.PoseType values: Sit = 2, GroundSit = 3, Doze = 4.
+            // EmoteController.PoseType values: Idle = 0, Sit = 2, GroundSit = 3, Doze = 4.
             // Chair sit (/lounge, alias /sit) and ground sit are flagged via EmoteMode;
-            // Doze has no EmoteMode in the sheet and is matched by its row id.
+            // Doze and Change Pose (/changepose, alias /cpose → standing idle poses)
+            // have no EmoteMode in the sheet and are matched by their row ids.
             byte? poseType = emote.RowId == DozeEmoteRowId ? (byte)4
+                : emote.RowId == ChangePoseEmoteRowId ? (byte)0
                 : emote.EmoteMode.RowId == ChairSitEmoteModeRowId ? (byte)2
                 : emote.EmoteMode.RowId == GroundSitEmoteModeRowId ? (byte)3
                 : null;
@@ -80,6 +101,8 @@ public class EmoteIconHelper
             var shortCmd = textCommand.Value.ShortCommand.ExtractText();
             var shortAlias = textCommand.Value.ShortAlias.ExtractText();
 
+            var timelineId = emote.ActionTimeline.Count > 0 ? emote.ActionTimeline[0].RowId : 0;
+
             foreach (var variant in new[] { cmd, alias, shortCmd, shortAlias })
             {
                 if (string.IsNullOrEmpty(variant))
@@ -90,6 +113,8 @@ public class EmoteIconHelper
                     poseTypeCommands.TryAdd(variant, poseType.Value);
                 if (anywhereId != null)
                     anywhereCommands.TryAdd(variant, anywhereId.Value);
+                if (timelineId != 0)
+                    commandTimelines.TryAdd(variant, (ushort)timelineId);
             }
         }
     }
@@ -116,6 +141,46 @@ public class EmoteIconHelper
     {
         var cmd = NormalizeCommand(command);
         return cmd != null && anywhereCommands.TryGetValue(cmd, out var emoteId) ? emoteId : null;
+    }
+
+    /// <summary>
+    /// The ActionTimeline id to play for a local preview of this command row,
+    /// or null when no timeline can be resolved.
+    /// </summary>
+    public ushort? GetPreviewTimeline(string command, int poseIndex)
+    {
+        var cmd = NormalizeCommand(command);
+        if (cmd == null)
+            return null;
+
+        if (poseTypeCommands.TryGetValue(cmd, out var poseType))
+        {
+            // Pose variants 2+ map to their pose loop file; pose 1 is the base animation
+            if (poseIndex >= 2)
+            {
+                var prefix = poseType switch
+                {
+                    0 => "",   // standing idle
+                    2 => "s_", // chair sit
+                    3 => "j_", // ground sit
+                    4 => "l_", // doze
+                    _ => null,
+                };
+                if (prefix == null)
+                    return null;
+
+                return poseLoopTimelines.TryGetValue($"emote/{prefix}pose{poseIndex - 1:00}_loop", out var poseTimeline)
+                    ? poseTimeline
+                    : null;
+            }
+
+            // Standing idle pose 1 is the true idle stance — it has no emote timeline;
+            // /changepose's own timeline is the transition flourish, not a pose
+            if (poseType == 0)
+                return null;
+        }
+
+        return commandTimelines.TryGetValue(cmd, out var timeline) ? timeline : null;
     }
 
     private static string? NormalizeCommand(string command)

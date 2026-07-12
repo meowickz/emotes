@@ -27,4 +27,18 @@ public class EmoteFolder
         foreach (var emote in folder.Emotes)
             yield return emote;
     }
+
+    /// <summary>
+    /// All emotes in sidebar display order: subfolders (recursively) first,
+    /// then this folder's own emotes — matching the tree rendering.
+    /// </summary>
+    public IEnumerable<EmoteEntry> EnumerateEmotesDisplayOrder()
+    {
+        foreach (var sub in Folders)
+        foreach (var emote in sub.EnumerateEmotesDisplayOrder())
+            yield return emote;
+
+        foreach (var emote in Emotes)
+            yield return emote;
+    }
 }

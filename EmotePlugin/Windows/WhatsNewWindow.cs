@@ -9,6 +9,14 @@ public class WhatsNewWindow : Window, IDisposable
 {
     private static readonly (string Version, string[] Changes)[] Changelog =
     {
+        ("1.3.0.0", new[]
+        {
+            "Animation preview: the eye button on a command row plays the animation locally with mods applied — only you see it; your character is locked until Stop Preview.",
+            "Mod library scanner: scan all installed Penumbra mods for emote animations and bulk-import them as emotes, with rename/skip/destination-folder review.",
+            "Standing idle poses (/changepose) now support direct pose selection, detection, and preview.",
+            "Conflict icons are priority-aware: green when this mod wins its shared emote slots, yellow when another mod overrides it.",
+            "Quick Access follows the sidebar's folder ordering, and all filter dropdowns pin the search box on top (Glamourer-style).",
+        }),
         ("1.2.0.0", new[]
         {
             "Pose selection: sit, ground sit and doze commands can specify a /cpose pose number and land directly in that pose — playing the row again while already sitting/dozing switches the pose in place.",

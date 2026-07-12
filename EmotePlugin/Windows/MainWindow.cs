@@ -54,7 +54,7 @@ public class MainWindow : Window, IDisposable
     private Guid conflictCacheEmoteId;
     private long conflictCacheTick;
     private int conflictCacheRevision = -1;
-    private Dictionary<string, string> cachedConflicts = new();
+    private Dictionary<string, (string Text, bool Winning)> cachedConflicts = new();
 
     // Mod picker state
     private string modSearchQuery = string.Empty;
@@ -77,8 +77,47 @@ public class MainWindow : Window, IDisposable
     private int cachedSearchRevision = -1;
     private List<EmoteEntry> cachedSearchResults = new();
 
+    // Preview-timeline lookups cached across frames (string allocs per row otherwise)
+    private readonly Dictionary<(string Command, int Pose), ushort?> previewTimelineCache = new();
+    private int previewTimelineCacheRevision = -1;
+
+    private ushort? GetPreviewTimelineCached(EmoteCommandEntry cmd)
+    {
+        if (previewTimelineCacheRevision != plugin.Configuration.Revision)
+        {
+            previewTimelineCache.Clear();
+            previewTimelineCacheRevision = plugin.Configuration.Revision;
+        }
+
+        var key = (cmd.Command, cmd.PoseIndex);
+        if (!previewTimelineCache.TryGetValue(key, out var timeline))
+        {
+            timeline = emoteIconHelper.GetPreviewTimeline(cmd.Command, cmd.PoseIndex);
+            previewTimelineCache[key] = timeline;
+        }
+
+        return timeline;
+    }
+
     // Import/export state
     private readonly FileDialogManager fileDialog = new();
+    // Mod scanner state
+    private sealed class ScanCandidate
+    {
+        public required string ModDirectory;
+        public required string ModName;
+        public string EmoteName = string.Empty;
+        public string CommandsTooltip = string.Empty;
+        public bool Selected;
+        public bool AlreadyUsed;
+        public List<(string Command, string Name, int Pose)> Rows = new();
+    }
+
+    private List<ScanCandidate>? pendingScan;
+    private bool scanPopupPending;
+    private Guid scanTargetFolderId = Guid.Empty;
+    private string scanTargetFolderLabel = "(Root)";
+
     private EmoteFolder? pendingImport;
     private readonly List<ImportModRow> pendingImportMods = new();
     private readonly List<(EmoteEntry Emote, string Path)> pendingImportEmotes = new();
@@ -118,12 +157,286 @@ public class MainWindow : Window, IDisposable
 
     /// <summary>
     /// Drawn from UiBuilder.Draw directly (not Window.Draw) so open file dialogs and
-    /// the import review modal survive the main window being closed mid-flow.
+    /// the import/scan review modals survive the main window being closed mid-flow.
     /// </summary>
     public void DrawOverlays()
     {
         fileDialog.Draw();
         DrawImportPopup();
+        DrawScanPopup();
+    }
+
+    private void RunModScan()
+    {
+        if (!penumbraService.Available)
+        {
+            importError = "Penumbra is not available.";
+            return;
+        }
+
+        var usedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var existing in emoteManager.GetRootFolder().EnumerateEmotes())
+        foreach (var mod in existing.AssociatedMods)
+            usedDirs.Add(mod.ModDirectory);
+
+        var modRoot = penumbraService.GetModRootDirectory();
+        var candidates = new List<ScanCandidate>();
+
+        foreach (var (dir, itemNames) in penumbraService.GetAllChangedItemNames())
+        {
+            var detected = new Dictionary<(string Command, int Pose), string>();
+            var hasPoseFilePaths = false;
+            foreach (var itemName in itemNames)
+            {
+                var resolved = emoteIconHelper.ResolveEmote(itemName);
+                if (resolved != null)
+                    detected.TryAdd((resolved.Value.Command, 0), resolved.Value.Name);
+                else if (!hasPoseFilePaths && PoseFileRegex.IsMatch(itemName))
+                    hasPoseFilePaths = true; // unidentified changed items are raw game paths
+            }
+
+            if (detected.Count == 0 && !hasPoseFilePaths)
+                continue; // no emote changes in this mod
+
+            if (!string.IsNullOrEmpty(modRoot))
+                CollectPoseRowsFromDisk(modRoot, dir, detected);
+
+            if (detected.Count == 0)
+                continue;
+
+            var name = cachedMods.TryGetValue(dir, out var n) && !string.IsNullOrWhiteSpace(n) ? n : dir;
+            var alreadyUsed = usedDirs.Contains(dir);
+            var rows = FinalizeDetectedRows(detected);
+            candidates.Add(new ScanCandidate
+            {
+                ModDirectory = dir,
+                ModName = name,
+                EmoteName = name,
+                Selected = !alreadyUsed,
+                AlreadyUsed = alreadyUsed,
+                Rows = rows,
+                CommandsTooltip = string.Join("\n", rows.Select(
+                    r => r.Pose > 0 ? $"{r.Command} (pose {r.Pose})" : r.Command)),
+            });
+        }
+
+        if (candidates.Count == 0)
+        {
+            importError = "No mods with emote animations found.";
+            return;
+        }
+
+        candidates.Sort((a, b) => string.Compare(a.ModName, b.ModName, StringComparison.OrdinalIgnoreCase));
+        pendingScan = candidates;
+        scanTargetFolderId = Guid.Empty;
+        scanTargetFolderLabel = "(Root)";
+        scanPopupPending = true;
+    }
+
+    private void DrawScanPopup()
+    {
+        if (scanPopupPending)
+        {
+            ImGui.OpenPopup("Scan Mods###ScanModsPopup");
+            scanPopupPending = false;
+        }
+
+        if (pendingScan == null)
+            return;
+
+        ImGui.SetNextWindowSize(new Vector2(760, 500), ImGuiCond.FirstUseEver);
+        var open = true;
+        if (!ImGui.BeginPopupModal("Scan Mods###ScanModsPopup", ref open))
+        {
+            pendingScan = null; // dismissed (Escape)
+            return;
+        }
+
+        var selectedCount = pendingScan.Count(c => c.Selected);
+        ImGui.Text($"Found {pendingScan.Count} mod(s) with emote animations — importing {selectedCount} as new emotes.");
+        ImGui.TextWrapped("Edit the emote names, untick mods you don't want. Mods already associated with an " +
+                          "existing emote are unticked by default.");
+
+        if (ImGui.SmallButton("Select All"))
+        {
+            foreach (var c in pendingScan)
+                c.Selected = true;
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select None"))
+        {
+            foreach (var c in pendingScan)
+                c.Selected = false;
+        }
+
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(220);
+        DrawScanFolderCombo();
+
+        ImGui.Spacing();
+
+        var footerHeight = ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y;
+        using (var child = ImRaii.Child("##ScanReview", new Vector2(-1, -footerHeight), true))
+        {
+            if (child.Success)
+                DrawScanTable();
+        }
+
+        ImGui.BeginDisabled(selectedCount == 0);
+        if (ImGui.Button("Import", new Vector2(120, 0)))
+        {
+            ApplyScanImport();
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndDisabled();
+
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new Vector2(120, 0)))
+        {
+            pendingScan = null;
+            ImGui.CloseCurrentPopup();
+        }
+
+        ImGui.EndPopup();
+
+        if (!open)
+            pendingScan = null;
+    }
+
+    private void DrawScanFolderCombo()
+    {
+        if (!ImGui.BeginCombo("##ScanTargetFolder", $"Into: {scanTargetFolderLabel}"))
+            return;
+
+        if (ImGui.Selectable("(Root)", scanTargetFolderId == Guid.Empty))
+        {
+            scanTargetFolderId = Guid.Empty;
+            scanTargetFolderLabel = "(Root)";
+        }
+
+        foreach (var (folder, path) in FoldersWithPaths(emoteManager.GetRootFolder(), string.Empty))
+        {
+            if (ImGui.Selectable($"{path}##{folder.Id}", folder.Id == scanTargetFolderId))
+            {
+                scanTargetFolderId = folder.Id;
+                scanTargetFolderLabel = path;
+            }
+        }
+
+        ImGui.EndCombo();
+    }
+
+    /// <summary> Folders with their full path labels, so same-named folders stay distinguishable. </summary>
+    private static IEnumerable<(EmoteFolder Folder, string Path)> FoldersWithPaths(EmoteFolder folder, string prefix)
+    {
+        foreach (var sub in folder.Folders)
+        {
+            var path = prefix.Length == 0 ? sub.Name : $"{prefix}/{sub.Name}";
+            yield return (sub, path);
+            foreach (var nested in FoldersWithPaths(sub, path))
+                yield return nested;
+        }
+    }
+
+    private void DrawScanTable()
+    {
+        if (pendingScan == null || !ImGui.BeginTable("##ScanTable", 5,
+                ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+            return;
+
+        ImGui.TableSetupColumn("##Sel", ImGuiTableColumnFlags.WidthFixed, ImGui.GetFrameHeight() + 4);
+        ImGui.TableSetupColumn("Mod", ImGuiTableColumnFlags.WidthStretch, 0.45f);
+        ImGui.TableSetupColumn("Emote Name", ImGuiTableColumnFlags.WidthStretch, 0.45f);
+        ImGui.TableSetupColumn("Commands", ImGuiTableColumnFlags.WidthFixed, 74);
+        ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 52);
+        ImGui.TableHeadersRow();
+
+        for (var i = 0; i < pendingScan.Count; i++)
+        {
+            var candidate = pendingScan[i];
+            ImGui.TableNextRow();
+            ImGui.PushID(i);
+
+            ImGui.TableNextColumn();
+            var selected = candidate.Selected;
+            if (ImGui.Checkbox("##scanSel", ref selected))
+                candidate.Selected = selected;
+
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            ImGui.Text(candidate.ModName);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(candidate.ModDirectory);
+
+            ImGui.TableNextColumn();
+            ImGui.BeginDisabled(!candidate.Selected);
+            var emoteName = candidate.EmoteName;
+            ImGui.SetNextItemWidth(-1);
+            if (ImGui.InputText("##scanName", ref emoteName, 128))
+                candidate.EmoteName = emoteName;
+            ImGui.EndDisabled();
+
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            ImGui.Text($"{candidate.Rows.Count}");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(candidate.CommandsTooltip);
+
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            if (candidate.AlreadyUsed)
+            {
+                ImGui.TextDisabled("Exists");
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("This mod is already associated with an existing emote.");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(0.35f, 0.9f, 0.35f, 1f), "New");
+            }
+
+            ImGui.PopID();
+        }
+
+        ImGui.EndTable();
+    }
+
+    private void ApplyScanImport()
+    {
+        if (pendingScan == null)
+            return;
+
+        var root = emoteManager.GetRootFolder();
+        var target = scanTargetFolderId == Guid.Empty
+            ? root
+            : root.SelfAndDescendants().FirstOrDefault(f => f.Id == scanTargetFolderId) ?? root;
+
+        foreach (var candidate in pendingScan.Where(c => c.Selected))
+        {
+            var emote = new EmoteEntry
+            {
+                Name = string.IsNullOrWhiteSpace(candidate.EmoteName) ? candidate.ModName : candidate.EmoteName,
+            };
+
+            var mod = new ModAssociation
+            {
+                ModDirectory = candidate.ModDirectory,
+                ModName = candidate.ModName,
+                Enabled = true,
+                Priority = 1,
+            };
+            emote.AssociatedMods.Add(mod);
+
+            foreach (var (command, name, pose) in candidate.Rows)
+                emote.Commands.Add(new EmoteCommandEntry { Name = name, Command = command, PoseIndex = pose });
+
+            emote.DefaultCommandId = emote.Commands.FirstOrDefault()?.Id ?? Guid.Empty;
+
+            emoteManager.AddEmote(emote, target);
+            emoteManager.SyncModSettingsFromPenumbra(emote, mod);
+        }
+
+        pendingScan = null;
     }
 
     public override void Draw()
@@ -308,6 +621,15 @@ public class MainWindow : Window, IDisposable
                 }
             });
         }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Scan Mods for Animations..."))
+        {
+            importError = string.Empty;
+            RunModScan();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Scan every installed Penumbra mod for emote animations and\nturn the matches into emotes (with a review step).");
 
         if (!string.IsNullOrEmpty(importError))
             ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), importError);
@@ -520,45 +842,60 @@ public class MainWindow : Window, IDisposable
         ImGui.SetNextItemWidth(-1);
         var comboWidth = ImGui.GetContentRegionAvail().X;
         ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 400));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
         if (ImGui.BeginCombo("##ImportModSelect", preview))
         {
+            // Filter pinned above the scrolling list — flush and square (Glamourer-style)
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0f);
             ImGui.SetNextItemWidth(-1);
             ImGui.InputTextWithHint("##ImportModSearch", "Search mods...", ref importModSearch, 128);
+            ImGui.PopStyleVar();
 
-            var originalLabel = row.Mod.DisplayName;
-            if (ImGui.Selectable($"(Keep original: {originalLabel})",
-                    !row.Remove && string.Equals(row.MapDir, row.Mod.ModDirectory, StringComparison.OrdinalIgnoreCase)))
+            if (ImGui.BeginChild("##ImportModItems", new Vector2(-1, 320)))
             {
-                row.MapDir = row.Mod.ModDirectory;
-                row.MapName = row.Mod.ModName;
-                row.Remove = false;
-            }
-
-            if (ImGui.Selectable("(Don't import this mod)", row.Remove))
-                row.Remove = true;
-
-            ImGui.Separator();
-
-            foreach (var (dir, name) in cachedMods)
-            {
-                if (!string.IsNullOrWhiteSpace(importModSearch) &&
-                    !dir.Contains(importModSearch, StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains(importModSearch, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var label = string.IsNullOrWhiteSpace(name) ? dir : name;
-                if (ImGui.Selectable($"{label}##{dir}",
-                        !row.Remove && string.Equals(row.MapDir, dir, StringComparison.OrdinalIgnoreCase)))
+                var originalLabel = row.Mod.DisplayName;
+                if (ImGui.Selectable($"(Keep original: {originalLabel})",
+                        !row.Remove && string.Equals(row.MapDir, row.Mod.ModDirectory, StringComparison.OrdinalIgnoreCase)))
                 {
-                    row.MapDir = dir;
-                    row.MapName = name;
+                    row.MapDir = row.Mod.ModDirectory;
+                    row.MapName = row.Mod.ModName;
                     row.Remove = false;
-                    importModSearch = string.Empty;
+                    ImGui.CloseCurrentPopup(); // child-hosted selectables don't auto-close
+                }
+
+                if (ImGui.Selectable("(Don't import this mod)", row.Remove))
+                {
+                    row.Remove = true;
+                    ImGui.CloseCurrentPopup();
+                }
+
+                ImGui.Separator();
+
+                foreach (var (dir, name) in cachedMods)
+                {
+                    if (!string.IsNullOrWhiteSpace(importModSearch) &&
+                        !dir.Contains(importModSearch, StringComparison.OrdinalIgnoreCase) &&
+                        !name.Contains(importModSearch, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var label = string.IsNullOrWhiteSpace(name) ? dir : name;
+                    if (ImGui.Selectable($"{label}##{dir}",
+                            !row.Remove && string.Equals(row.MapDir, dir, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        row.MapDir = dir;
+                        row.MapName = name;
+                        row.Remove = false;
+                        importModSearch = string.Empty;
+                        ImGui.CloseCurrentPopup();
+                    }
                 }
             }
 
+            ImGui.EndChild();
             ImGui.EndCombo();
         }
+
+        ImGui.PopStyleVar();
     }
 
     private void ApplyImport()
@@ -1450,6 +1787,17 @@ public class MainWindow : Window, IDisposable
             emoteManager.UseEmote(emote);
 
         ImGui.SameLine();
+        var previewing = emoteManager.IsPreviewing;
+        if (previewing)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.85f, 0.55f, 0.1f, 1f));
+        if (ImGui.Button("Stop Preview"))
+            emoteManager.StopPreview();
+        if (previewing)
+            ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Cancel the running local preview and unlock your character.");
+
+        ImGui.SameLine();
         if (ImGui.Button("Duplicate"))
         {
             var dup = emoteManager.DuplicateEmote(emote);
@@ -1467,9 +1815,10 @@ public class MainWindow : Window, IDisposable
         ImGui.PopStyleColor();
     }
 
-    // cpose variant animation files: emote/pose0N = stand, s_ = chair sit, j_ = ground sit, l_ = doze
+    // cpose variant animation files: emote/pose0N = standing idle, s_ = chair sit,
+    // j_ = ground sit, l_ = doze, b_ = weapon drawn (no playable command — skipped)
     private static readonly Regex PoseFileRegex = new(
-        @"emote/(s_|j_|l_)pose(\d{2})_(?:loop|start)\.pap",
+        @"emote/(s_|j_|l_|b_)?pose(\d{2})_(?:loop|start)\.pap",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private void DetectCommandsFromMods(EmoteEntry emote)
@@ -1502,17 +1851,8 @@ public class MainWindow : Window, IDisposable
 
         DetectPoseFiles(emote, detected);
 
-        // A pose-specific row supersedes the generic row for the same command
-        var poseCommands = new HashSet<string>(
-            detected.Keys.Where(k => k.Pose > 0).Select(k => k.Command), StringComparer.OrdinalIgnoreCase);
-        foreach (var key in detected.Keys.Where(k => k.Pose == 0 && poseCommands.Contains(k.Command)).ToList())
-            detected.Remove(key);
-
         var added = 0;
-        // Normal emotes first, facial expressions after; pose variants in ascending order
-        foreach (var ((command, pose), name) in detected
-                     .OrderBy(kv => emoteIconHelper.IsExpressionCommand(kv.Key.Command) ? 1 : 0)
-                     .ThenBy(kv => kv.Key.Pose))
+        foreach (var (command, name, pose) in FinalizeDetectedRows(detected))
         {
             if (emote.Commands.Any(c => c.PoseIndex == pose && c.Command.TrimStart('/').Equals(
                     command.TrimStart('/'), StringComparison.OrdinalIgnoreCase)))
@@ -1548,49 +1888,80 @@ public class MainWindow : Window, IDisposable
             return;
 
         foreach (var mod in emote.AssociatedMods)
+            CollectPoseRowsFromDisk(modRoot, mod.ModDirectory, detected);
+    }
+
+    /// <summary> Scan one mod folder's option files for cpose variant animations. </summary>
+    private void CollectPoseRowsFromDisk(string modRoot, string modDirectory, Dictionary<(string Command, int Pose), string> detected)
+    {
+        var modDir = Path.Combine(modRoot, modDirectory);
+        if (!Directory.Exists(modDir))
+            return;
+
+        // Only the option files list replaced game paths — skip meta.json and friends
+        IEnumerable<string> optionFiles = Directory.EnumerateFiles(modDir, "group_*.json", SearchOption.TopDirectoryOnly);
+        var defaultMod = Path.Combine(modDir, "default_mod.json");
+        if (File.Exists(defaultMod))
+            optionFiles = optionFiles.Append(defaultMod);
+
+        foreach (var jsonFile in optionFiles)
         {
-            var modDir = Path.Combine(modRoot, mod.ModDirectory);
-            if (!Directory.Exists(modDir))
-                continue;
-
-            // Penumbra option files (default_mod.json, group_*.json) list replaced game paths
-            foreach (var jsonFile in Directory.EnumerateFiles(modDir, "*.json", SearchOption.TopDirectoryOnly))
+            string text;
+            try
             {
-                string text;
-                try
+                text = File.ReadAllText(jsonFile);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (Match match in PoseFileRegex.Matches(text))
+            {
+                byte? poseType = match.Groups[1].Value.ToLowerInvariant() switch
                 {
-                    text = File.ReadAllText(jsonFile);
-                }
-                catch
-                {
+                    "" => 0,   // standing idle (/changepose)
+                    "s_" => 2, // chair sit
+                    "j_" => 3, // ground sit
+                    "l_" => 4, // doze
+                    _ => null, // b_ = weapon drawn — no playable command
+                };
+                if (poseType == null)
                     continue;
-                }
 
-                foreach (Match match in PoseFileRegex.Matches(text))
-                {
-                    byte poseType = match.Groups[1].Value.ToLowerInvariant() switch
-                    {
-                        "s_" => 2, // chair sit
-                        "j_" => 3, // ground sit
-                        "l_" => 4, // doze
-                        _ => 0,
-                    };
-                    if (poseType == 0)
-                        continue;
+                var info = emoteIconHelper.GetPoseTypeInfo(poseType.Value);
+                if (info == null)
+                    continue;
 
-                    var info = emoteIconHelper.GetPoseTypeInfo(poseType);
-                    if (info == null)
-                        continue;
+                // File pose0N replaces cpose index N; our PoseIndex is 1-based
+                if (!int.TryParse(match.Groups[2].Value, out var fileIndex))
+                    continue;
 
-                    // File pose0N replaces cpose index N; our PoseIndex is 1-based
-                    if (!int.TryParse(match.Groups[2].Value, out var fileIndex))
-                        continue;
-
-                    var pose = fileIndex + 1;
-                    detected.TryAdd((info.Value.Command, pose), $"{info.Value.Name} Pose {pose}");
-                }
+                var pose = fileIndex + 1;
+                var baseName = poseType.Value == 0 ? "Idle" : info.Value.Name;
+                detected.TryAdd((info.Value.Command, pose), $"{baseName} Pose {pose}");
             }
         }
+    }
+
+    /// <summary>
+    /// Turn a detected (command, pose) map into ordered command rows: pose-specific rows
+    /// supersede the generic row for the same command; normal emotes before expressions,
+    /// pose variants ascending.
+    /// </summary>
+    private List<(string Command, string Name, int Pose)> FinalizeDetectedRows(
+        Dictionary<(string Command, int Pose), string> detected)
+    {
+        var poseCommands = new HashSet<string>(
+            detected.Keys.Where(k => k.Pose > 0).Select(k => k.Command), StringComparer.OrdinalIgnoreCase);
+        foreach (var key in detected.Keys.Where(k => k.Pose == 0 && poseCommands.Contains(k.Command)).ToList())
+            detected.Remove(key);
+
+        return detected
+            .OrderBy(kv => emoteIconHelper.IsExpressionCommand(kv.Key.Command) ? 1 : 0)
+            .ThenBy(kv => kv.Key.Pose)
+            .Select(kv => (kv.Key.Command, kv.Value, kv.Key.Pose))
+            .ToList();
     }
 
     private void DrawCommandTable(EmoteEntry emote)
@@ -1605,7 +1976,7 @@ public class MainWindow : Window, IDisposable
             ImGui.TableSetupColumn("Command", ImGuiTableColumnFlags.WidthStretch, 0.40f);
             ImGui.TableSetupColumn("Alias", ImGuiTableColumnFlags.WidthStretch, 0.30f);
             ImGui.TableSetupColumn("Pose", ImGuiTableColumnFlags.WidthFixed, 44);
-            ImGui.TableSetupColumn("##CmdActions", ImGuiTableColumnFlags.WidthFixed, 104);
+            ImGui.TableSetupColumn("##CmdActions", ImGuiTableColumnFlags.WidthFixed, 130);
             ImGui.TableHeadersRow();
 
             EmoteCommandEntry? toRemove = null;
@@ -1695,6 +2066,14 @@ public class MainWindow : Window, IDisposable
                 if (ImGuiComponents.IconButton("##cmdPlay", FontAwesomeIcon.Play))
                     emoteManager.UseEmote(emote, cmd);
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip("Play this command");
+
+                ImGui.SameLine(0, 2);
+                ImGui.BeginDisabled(GetPreviewTimelineCached(cmd) == null);
+                if (ImGuiComponents.IconButton("##cmdPreview", FontAwesomeIcon.Eye))
+                    emoteManager.PreviewEmote(emote, cmd);
+                ImGui.EndDisabled();
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Preview the animation locally — only you see it.\nMods are applied; your character is locked until you press Stop Preview.");
 
                 ImGui.SameLine(0, 2);
                 ImGui.BeginDisabled(i == 0);
@@ -1812,7 +2191,7 @@ public class MainWindow : Window, IDisposable
         return state;
     }
 
-    private Dictionary<string, string> GetEmoteConflicts(EmoteEntry emote)
+    private Dictionary<string, (string Text, bool Winning)> GetEmoteConflicts(EmoteEntry emote)
     {
         if (conflictCacheEmoteId != emote.Id ||
             conflictCacheTick != lastCacheRefresh ||
@@ -1829,19 +2208,19 @@ public class MainWindow : Window, IDisposable
 
     /// <summary>
     /// Per mod directory, a description of the emote commands it shares with other enabled
-    /// associations of the same emote or with mods enabled in the target collection.
-    /// Empty when there are no conflicts.
+    /// associations of the same emote or with mods enabled in the target collection, plus
+    /// whether this mod out-prioritizes every rival. Empty when there are no conflicts.
     /// </summary>
-    private Dictionary<string, string> ComputeEmoteConflicts(EmoteEntry emote)
+    private Dictionary<string, (string Text, bool Winning)> ComputeEmoteConflicts(EmoteEntry emote)
     {
-        var result = new Dictionary<string, string>();
+        var result = new Dictionary<string, (string Text, bool Winning)>();
         if (!penumbraService.Available || emote.AssociatedMods.Count == 0)
             return result;
 
-        void AddLine(string modDirectory, string line)
+        void AddLine(string modDirectory, string line, bool lineWins)
             => result[modDirectory] = result.TryGetValue(modDirectory, out var existing)
-                ? existing + "\n" + line
-                : line;
+                ? (existing.Text + "\n" + line, existing.Winning && lineWins)
+                : (line, lineWins);
 
         // Conflicts between the emote's own associated mods
         var byCommand = new Dictionary<string, List<ModAssociation>>(StringComparer.OrdinalIgnoreCase);
@@ -1865,8 +2244,10 @@ public class MainWindow : Window, IDisposable
 
             foreach (var mod in mods)
             {
-                var others = mods.Where(m => m != mod).Select(m => $"{m.DisplayName} (priority {m.Priority})");
-                AddLine(mod.ModDirectory, $"{cmd} — also changed by associated mod {string.Join(", ", others)}");
+                var rivals = mods.Where(m => m != mod).ToList();
+                var others = rivals.Select(m => $"{m.DisplayName} (priority {m.Priority})");
+                var wins = rivals.All(m => mod.Priority > m.Priority);
+                AddLine(mod.ModDirectory, $"{cmd} — also changed by associated mod {string.Join(", ", others)}", wins);
             }
         }
 
@@ -1895,7 +2276,8 @@ public class MainWindow : Window, IDisposable
                         continue;
 
                     var name = cachedMods.TryGetValue(dir, out var n) && !string.IsNullOrWhiteSpace(n) ? n : dir;
-                    AddLine(mod.ModDirectory, $"{cmd} — also changed by enabled collection mod {name} (priority {priority})");
+                    AddLine(mod.ModDirectory, $"{cmd} — also changed by enabled collection mod {name} (priority {priority})",
+                        mod.Priority > priority);
                 }
             }
         }
@@ -2091,13 +2473,20 @@ public class MainWindow : Window, IDisposable
             var cursorPos = ImGui.GetCursorPosY();
             ImGui.SetCursorPosY(cursorPos + pad);
 
-            if (conflicts.TryGetValue(mod.ModDirectory, out var conflictText))
+            if (conflicts.TryGetValue(mod.ModDirectory, out var conflict))
             {
                 ImGui.PushFont(UiBuilder.IconFont);
-                ImGui.TextColored(new Vector4(1f, 0.75f, 0.2f, 1f), FontAwesomeIcon.ExclamationTriangle.ToIconString());
+                if (conflict.Winning)
+                    ImGui.TextColored(new Vector4(0.35f, 0.9f, 0.35f, 1f), FontAwesomeIcon.ExclamationTriangle.ToIconString());
+                else
+                    ImGui.TextColored(new Vector4(1f, 0.75f, 0.2f, 1f), FontAwesomeIcon.ExclamationTriangle.ToIconString());
                 ImGui.PopFont();
                 if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip($"Shares emote slots with other associated mods:\n{conflictText}\nThe mod with the higher priority wins.");
+                {
+                    ImGui.SetTooltip(conflict.Winning
+                        ? $"Shares emote slots with other mods, but this mod has the highest priority and wins:\n{conflict.Text}"
+                        : $"Shares emote slots with other mods:\n{conflict.Text}\nThe mod with the higher (or equal) priority wins — raise this mod's priority to take over.");
+                }
                 ImGui.SameLine();
             }
 
@@ -2169,41 +2558,53 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
         ImGui.SetNextItemWidth(comboWidth);
         ImGui.SetNextWindowSizeConstraints(new Vector2(comboWidth, 0), new Vector2(comboWidth, 400));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
         if (ImGui.BeginCombo("##AddModCombo", "Add mod..."))
         {
+            // Filter pinned above the scrolling list — flush and square (Glamourer-style)
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0f);
             ImGui.SetNextItemWidth(-1);
             ImGui.InputTextWithHint("##AddModSearch", "Search mods...", ref addModSearchQuery, 128);
+            ImGui.PopStyleVar();
 
-            foreach (var (dir, name) in cachedMods)
+            if (ImGui.BeginChild("##AddModItems", new Vector2(-1, 320)))
             {
-                if (emote.AssociatedMods.Any(existing => existing.ModDirectory == dir))
-                    continue;
-
-                if (!string.IsNullOrWhiteSpace(addModSearchQuery) &&
-                    !dir.Contains(addModSearchQuery, StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains(addModSearchQuery, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var label = string.IsNullOrWhiteSpace(name) ? dir : name;
-                if (ImGui.Selectable($"{label}##{dir}"))
+                foreach (var (dir, name) in cachedMods)
                 {
-                    var newMod = new ModAssociation
+                    if (emote.AssociatedMods.Any(existing => existing.ModDirectory == dir))
+                        continue;
+
+                    if (!string.IsNullOrWhiteSpace(addModSearchQuery) &&
+                        !dir.Contains(addModSearchQuery, StringComparison.OrdinalIgnoreCase) &&
+                        !name.Contains(addModSearchQuery, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var label = string.IsNullOrWhiteSpace(name) ? dir : name;
+                    if (ImGui.Selectable($"{label}##{dir}"))
                     {
-                        ModDirectory = dir,
-                        ModName = name,
-                        Enabled = true,
-                        Priority = 1,
-                    };
-                    emote.AssociatedMods.Add(newMod);
-                    // Snapshot the mod's current settings so the association applies what Penumbra shows now
-                    emoteManager.SyncModSettingsFromPenumbra(emote, newMod);
-                    emoteManager.UpdateEmote(emote);
-                    addModSearchQuery = string.Empty;
+                        var newMod = new ModAssociation
+                        {
+                            ModDirectory = dir,
+                            ModName = name,
+                            Enabled = true,
+                            Priority = 1,
+                        };
+                        emote.AssociatedMods.Add(newMod);
+                        // Snapshot the mod's current settings so the association applies what Penumbra shows now
+                        emoteManager.SyncModSettingsFromPenumbra(emote, newMod);
+                        emoteManager.UpdateEmote(emote);
+                        addModSearchQuery = string.Empty;
+                        // Selectables inside a child window don't auto-close the popup
+                        ImGui.CloseCurrentPopup();
+                    }
                 }
             }
 
+            ImGui.EndChild();
             ImGui.EndCombo();
         }
+
+        ImGui.PopStyleVar();
     }
 
     private void RefreshCacheIfNeeded()

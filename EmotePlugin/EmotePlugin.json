@@ -6,7 +6,7 @@
   "ApplicableVersion": "any",
   "RepoUrl": "https://github.com/meowickz/emotes",
   "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-  "Changelog": "Direct pose selection for sit/groundsit/doze with auto-detection from mod files, Sit/Doze Anywhere option, selective import with folder merging.",
+  "Changelog": "Local animation preview, mod library scanner with bulk import, standing idle pose support, priority-aware conflict icons, quick access ordering and filter polish.",
   "Tags": [
     "emote",
     "penumbra",

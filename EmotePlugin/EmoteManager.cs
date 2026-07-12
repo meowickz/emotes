@@ -46,13 +46,15 @@ public class EmoteManager : IDisposable
 
     public void Dispose()
     {
+        // Never leave the character anim-locked by a running preview
+        StopPreview();
         framework.Update -= OnFrameworkUpdate;
     }
 
     public EmoteFolder GetRootFolder() => configuration.RootFolder;
 
     public List<EmoteEntry> GetAllEmotes()
-        => configuration.RootFolder.EnumerateEmotes().ToList();
+        => configuration.RootFolder.EnumerateEmotesDisplayOrder().ToList();
 
     public int GetEmoteCount()
         => CountEmotes(configuration.RootFolder);
@@ -86,6 +88,13 @@ public class EmoteManager : IDisposable
         folder.Emotes.Add(entry);
         configuration.Save();
         return entry;
+    }
+
+    /// <summary> Add a fully built emote entry (e.g. from the mod scanner). </summary>
+    public void AddEmote(EmoteEntry entry, EmoteFolder? folder = null)
+    {
+        (folder ?? configuration.RootFolder).Emotes.Add(entry);
+        configuration.Save();
     }
 
     public void RemoveEmote(EmoteEntry emote)
@@ -141,6 +150,9 @@ public class EmoteManager : IDisposable
             return;
         }
 
+        // An anim-locked preview would block the real emote
+        StopPreview();
+
         // Remove previous emote's temporary mod settings before applying new ones
         if (emote.AutoToggleMod)
         {
@@ -152,12 +164,7 @@ public class EmoteManager : IDisposable
             if (lastUsedEmote != null && lastUsedEmote.Id != emote.Id)
                 DisableEmoteMods(lastUsedEmote, skipRedraw: !needsRedraw);
 
-            foreach (var mod in emote.AssociatedMods)
-            {
-                penumbraService.ApplyTemporaryModSettings(
-                    mod.ModDirectory, mod.Enabled, mod.Inherit, mod.Priority,
-                    emote.PenumbraCollectionId, mod.ModName, mod.Settings);
-            }
+            ApplyAssociatedMods(emote);
 
             lastUsedEmote = emote;
             lastUsedCommand = cmd.Command;
@@ -171,12 +178,17 @@ public class EmoteManager : IDisposable
 
         var poseType = cmd.PoseIndex > 0 ? emoteData.GetPoseType(cmd.Command) : null;
 
-        // Already in the target stance: only switch the pose — re-sending the
-        // emote command would cancel the emote (e.g. /doze while dozing stands up).
-        if (poseType != null && GetLocalPoseState()?.PoseType == poseType.Value)
+        // Only switch the pose (no command sent) when already in the target stance —
+        // re-sending the emote would cancel it (e.g. /doze while dozing stands up) —
+        // or for standing idle poses, where /changepose IS the cycle command and
+        // sending it raw would move the pose before the watcher corrects it.
+        var currentPoseType = GetLocalPoseState()?.PoseType;
+        if (poseType != null && (poseType.Value == 0 || currentPoseType == poseType.Value))
         {
             QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
-            log.Information($"Used emote: {emote.Name} (pose change to {cmd.PoseIndex})");
+            log.Information(currentPoseType == poseType.Value
+                ? $"Used emote: {emote.Name} (pose change to {cmd.PoseIndex})"
+                : $"Emote {emote.Name}: idle pose {cmd.PoseIndex} queued — applies when standing (5s timeout).");
             return;
         }
 
@@ -202,6 +214,136 @@ public class EmoteManager : IDisposable
         // Once the stance is entered, cycle /cpose to the requested pose
         if (poseType != null)
             QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
+    }
+
+    // Saved character state while a local preview is running (mode, mode param, base override)
+    private (FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes Mode, byte ModeParam, ushort BaseOverride)? previewOriginalState;
+    private System.Numerics.Vector3 previewStartPosition;
+
+    /// <summary> Whether a local preview animation is currently active. </summary>
+    public bool IsPreviewing => previewOriginalState != null;
+
+    /// <summary>
+    /// Play this command's animation on the local player only — a client-side base-override
+    /// playback (the Brio mechanism) that the server never sees, so other players see
+    /// nothing. The character is anim-locked until StopPreview restores it. The emote's
+    /// mods are applied first (no redraw needed: animation files load when playback starts).
+    /// Returns false when no timeline could be resolved.
+    /// </summary>
+    public unsafe bool PreviewEmote(EmoteEntry emote, EmoteCommandEntry cmd)
+    {
+        var timelineId = emoteData.GetPreviewTimeline(cmd.Command, cmd.PoseIndex);
+        if (timelineId == null)
+        {
+            log.Warning($"No preview animation found for '{cmd.Command}' (pose {cmd.PoseIndex}).");
+            return false;
+        }
+
+        // Capture the player once — LocalPlayer can go null between accesses
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero)
+            return false;
+
+        var chara = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
+
+        // A queued pose change must not fire /cpose into the anim lock
+        pendingPose = null;
+
+        // Track preview-applied mods exactly like a real use, so the next
+        // emote's cleanup pass removes them
+        if (emote.AutoToggleMod)
+        {
+            if (lastUsedEmote != null && lastUsedEmote.Id != emote.Id)
+                DisableEmoteMods(lastUsedEmote, skipRedraw: true);
+
+            ApplyAssociatedMods(emote);
+            lastUsedEmote = emote;
+            lastUsedCommand = null;
+        }
+
+        // Keep the FIRST original state when chaining previews
+        previewOriginalState ??= (chara->Mode, chara->ModeParam, chara->Timeline.BaseOverride);
+        previewStartPosition = localPlayer.Position;
+
+        chara->SetMode(FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes.AnimLock, 0);
+        chara->Timeline.BaseOverride = timelineId.Value;
+        chara->Timeline.TimelineSequencer.PlayTimeline(timelineId.Value, null);
+
+        log.Information($"Previewing emote: {emote.Name} (timeline {timelineId.Value}, local only)");
+        return true;
+    }
+
+    private void ApplyAssociatedMods(EmoteEntry emote)
+    {
+        foreach (var mod in emote.AssociatedMods)
+        {
+            penumbraService.ApplyTemporaryModSettings(
+                mod.ModDirectory, mod.Enabled, mod.Inherit, mod.Priority,
+                emote.PenumbraCollectionId, mod.ModName, mod.Settings);
+        }
+    }
+
+    /// <summary> Cancel a running local preview and restore the character's normal state. </summary>
+    public unsafe void StopPreview()
+    {
+        if (previewOriginalState == null)
+            return;
+
+        var original = previewOriginalState.Value;
+        previewOriginalState = null;
+
+        var chara = GetLocalCharacter();
+        if (chara == null)
+            return;
+
+        chara->Timeline.BaseOverride = original.BaseOverride;
+        // Restore through SetMode — a raw field write leaves the game's mode
+        // machinery thinking we're still anim-locked ("operating a siege machine")
+        chara->SetMode(original.Mode, original.ModeParam);
+        chara->Timeline.TimelineSequencer.PlayTimeline(3, null); // 3 = normal idle blend
+    }
+
+    /// <summary>
+    /// Preview safety net, per framework tick: if the character moved or something else
+    /// (combat, knockback, mounting, zoning) took over the character mode while a preview
+    /// was active, release the preview instead of fighting or clobbering the new state.
+    /// </summary>
+    private unsafe void WatchPreview()
+    {
+        if (previewOriginalState == null)
+            return;
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero)
+        {
+            // Logged out / zoning — the character is gone, nothing to restore
+            previewOriginalState = null;
+            return;
+        }
+
+        var chara = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
+
+        if (chara->Mode != FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes.AnimLock)
+        {
+            // The game changed the mode out from under us — accept the new mode,
+            // but still clear our animation override so it can't linger
+            var original = previewOriginalState.Value;
+            previewOriginalState = null;
+            chara->Timeline.BaseOverride = original.BaseOverride;
+            return;
+        }
+
+        if (System.Numerics.Vector3.DistanceSquared(localPlayer.Position, previewStartPosition) > 0.01f)
+            StopPreview(); // movement broke through the lock — restore cleanly
+    }
+
+    private unsafe FFXIVClientStructs.FFXIV.Client.Game.Character.Character* GetLocalCharacter()
+    {
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null || localPlayer.Address == nint.Zero)
+            return null;
+
+        return (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
     }
 
     /// <summary> Execute an emote by id through the hotbar module's scratch slot. </summary>
@@ -238,6 +380,8 @@ public class EmoteManager : IDisposable
     /// </summary>
     private void OnFrameworkUpdate(IFramework _)
     {
+        WatchPreview();
+
         if (pendingPose == null)
             return;
 
@@ -287,12 +431,7 @@ public class EmoteManager : IDisposable
 
     public void ApplyAllModSettings(EmoteEntry emote)
     {
-        foreach (var mod in emote.AssociatedMods)
-        {
-            penumbraService.ApplyTemporaryModSettings(
-                mod.ModDirectory, mod.Enabled, mod.Inherit, mod.Priority,
-                emote.PenumbraCollectionId, mod.ModName, mod.Settings);
-        }
+        ApplyAssociatedMods(emote);
         penumbraService.RedrawSelf();
     }
 
