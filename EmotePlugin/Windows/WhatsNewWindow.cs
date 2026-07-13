@@ -9,6 +9,11 @@ public class WhatsNewWindow : Window, IDisposable
 {
     private static readonly (string Version, string[] Changes)[] Changelog =
     {
+        ("1.3.1.0", new[]
+        {
+            "Mod library scanner now filters out VFX/effect-only mods — a mod must replace an actual emote animation to appear in the scan.",
+            "Stop Preview is disabled unless an animation is currently previewing.",
+        }),
         ("1.3.0.0", new[]
         {
             "Animation preview: the eye button on a command row plays the animation locally with mods applied — only you see it; your character is locked until Stop Preview.",

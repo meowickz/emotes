@@ -6,7 +6,7 @@
   "ApplicableVersion": "any",
   "RepoUrl": "https://github.com/meowickz/emotes",
   "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-  "Changelog": "Local animation preview, mod library scanner with bulk import, standing idle pose support, priority-aware conflict icons, quick access ordering and filter polish.",
+  "Changelog": "Mod scanner now filters out VFX-only mods (requires an actual emote animation); Stop Preview is disabled when nothing is previewing.",
   "Tags": [
     "emote",
     "penumbra",

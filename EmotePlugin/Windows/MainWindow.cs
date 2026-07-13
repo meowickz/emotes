@@ -198,10 +198,14 @@ public class MainWindow : Window, IDisposable
             if (detected.Count == 0 && !hasPoseFilePaths)
                 continue; // no emote changes in this mod
 
+            // Verify on disk that the mod actually replaces an emote animation (.pap),
+            // not just VFX/sound tied to an emote. Without disk access we can't tell,
+            // so fall back to including the mod.
+            var hasEmoteAnimation = true;
             if (!string.IsNullOrEmpty(modRoot))
-                CollectPoseRowsFromDisk(modRoot, dir, detected);
+                hasEmoteAnimation = CollectPoseRowsFromDisk(modRoot, dir, detected);
 
-            if (detected.Count == 0)
+            if (!hasEmoteAnimation || detected.Count == 0)
                 continue;
 
             var name = cachedMods.TryGetValue(dir, out var n) && !string.IsNullOrWhiteSpace(n) ? n : dir;
@@ -1790,11 +1794,13 @@ public class MainWindow : Window, IDisposable
         var previewing = emoteManager.IsPreviewing;
         if (previewing)
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.85f, 0.55f, 0.1f, 1f));
+        ImGui.BeginDisabled(!previewing);
         if (ImGui.Button("Stop Preview"))
             emoteManager.StopPreview();
+        ImGui.EndDisabled();
         if (previewing)
             ImGui.PopStyleColor();
-        if (ImGui.IsItemHovered())
+        if (previewing && ImGui.IsItemHovered())
             ImGui.SetTooltip("Cancel the running local preview and unlock your character.");
 
         ImGui.SameLine();
@@ -1819,6 +1825,13 @@ public class MainWindow : Window, IDisposable
     // j_ = ground sit, l_ = doze, b_ = weapon drawn (no playable command — skipped)
     private static readonly Regex PoseFileRegex = new(
         @"emote/(s_|j_|l_|b_)?pose(\d{2})_(?:loop|start)\.pap",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Any emote animation file (.pap under an emote path). Distinguishes an actual
+    // animation replacer from a VFX/sound-only mod that Penumbra still reports as
+    // changing "Emote: X" because the effect is tied to that emote.
+    private static readonly Regex EmoteAnimationRegex = new(
+        @"emote/[^""]*\.pap",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private void DetectCommandsFromMods(EmoteEntry emote)
@@ -1891,12 +1904,16 @@ public class MainWindow : Window, IDisposable
             CollectPoseRowsFromDisk(modRoot, mod.ModDirectory, detected);
     }
 
-    /// <summary> Scan one mod folder's option files for cpose variant animations. </summary>
-    private void CollectPoseRowsFromDisk(string modRoot, string modDirectory, Dictionary<(string Command, int Pose), string> detected)
+    /// <summary>
+    /// Scan one mod folder's option files for cpose variant animations, adding pose rows.
+    /// Returns whether the mod replaces any emote animation (.pap) file — false for a
+    /// VFX/sound-only mod, used to keep those out of the scanner.
+    /// </summary>
+    private bool CollectPoseRowsFromDisk(string modRoot, string modDirectory, Dictionary<(string Command, int Pose), string> detected)
     {
         var modDir = Path.Combine(modRoot, modDirectory);
         if (!Directory.Exists(modDir))
-            return;
+            return false;
 
         // Only the option files list replaced game paths — skip meta.json and friends
         IEnumerable<string> optionFiles = Directory.EnumerateFiles(modDir, "group_*.json", SearchOption.TopDirectoryOnly);
@@ -1904,6 +1921,7 @@ public class MainWindow : Window, IDisposable
         if (File.Exists(defaultMod))
             optionFiles = optionFiles.Append(defaultMod);
 
+        var hasEmoteAnimation = false;
         foreach (var jsonFile in optionFiles)
         {
             string text;
@@ -1915,6 +1933,9 @@ public class MainWindow : Window, IDisposable
             {
                 continue;
             }
+
+            if (!hasEmoteAnimation && EmoteAnimationRegex.IsMatch(text))
+                hasEmoteAnimation = true;
 
             foreach (Match match in PoseFileRegex.Matches(text))
             {
@@ -1942,6 +1963,8 @@ public class MainWindow : Window, IDisposable
                 detected.TryAdd((info.Value.Command, pose), $"{baseName} Pose {pose}");
             }
         }
+
+        return hasEmoteAnimation;
     }
 
     /// <summary>
