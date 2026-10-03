@@ -40,6 +40,7 @@ public sealed class Plugin : IDalamudPlugin
         PenumbraService = new PenumbraService(PluginInterface, Log);
         var emoteIconHelper = new EmoteIconHelper(TextureProvider, DataManager);
         EmoteManager = new EmoteManager(Configuration, PenumbraService, emoteIconHelper, Framework, ObjectTable, Log);
+        EmoteManager.MigrateDozePoseNumbers();
         MainWindow = new MainWindow(this, EmoteManager, PenumbraService, emoteIconHelper);
         QuickAccessWindow = new QuickAccessWindow(this, EmoteManager, PenumbraService, emoteIconHelper, clientState, Condition);
         WhatsNewWindow = new WhatsNewWindow();

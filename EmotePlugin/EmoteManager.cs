@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Newtonsoft.Json;
@@ -28,8 +29,26 @@ public class EmoteManager : IDisposable
     private EmoteEntry? lastUsedEmote;
     private string? lastUsedCommand;
 
-    // A pose change waiting for the character to enter the right stance
-    private (byte PoseType, byte TargetIndex, DateTime Deadline)? pendingPose;
+    // A pose change waiting for the character to enter the right stance, stepped one /cpose at a time
+    private PendingPose? pendingPose;
+
+    private sealed class PendingPose
+    {
+        public required byte PoseType;
+        public required byte TargetIndex;
+        public DateTime Deadline;
+        // Pose index when the last /cpose was sent, and when — null before the first step
+        public byte? SentFromIndex;
+        public DateTime SentAt;
+        // When the stance was first seen entered — the pose index is not reliable right away
+        public DateTime? InStanceSince;
+    }
+
+    // Wait this long after entering the stance before the first /cpose
+    private static readonly TimeSpan PoseStanceSettle = TimeSpan.FromSeconds(0.5);
+
+    // Resend a /cpose that didn't change the pose after this long (dropped mid-transition)
+    private static readonly TimeSpan PoseStepRetry = TimeSpan.FromSeconds(1.2);
 
     public EmoteManager(Configuration configuration, PenumbraService penumbraService, EmoteIconHelper emoteData,
         IFramework framework, IObjectTable objectTable, IPluginLog log)
@@ -42,13 +61,17 @@ public class EmoteManager : IDisposable
         this.log = log;
 
         framework.Update += OnFrameworkUpdate;
+        penumbraService.LocalPlayerRedrawn += OnLocalPlayerRedrawn;
     }
 
     public void Dispose()
     {
         // Never leave the character anim-locked by a running preview
         StopPreview();
+        // Nor holding a pose loop as its base animation
+        StopTransitionSkip();
         framework.Update -= OnFrameworkUpdate;
+        penumbraService.LocalPlayerRedrawn -= OnLocalPlayerRedrawn;
     }
 
     public EmoteFolder GetRootFolder() => configuration.RootFolder;
@@ -88,6 +111,46 @@ public class EmoteManager : IDisposable
         folder.Emotes.Add(entry);
         configuration.Save();
         return entry;
+    }
+
+    /// <summary>
+    /// Config v2: the mod scanner numbered doze pose rows by file name (v0: l_pose0N = pose
+    /// N+1, v1: pose N), but the game orders doze poses as bed_liedown, l_pose02, l_pose01.
+    /// Renumber the rows it created, recognizable by their generated "Doze Pose N" name.
+    /// </summary>
+    public void MigrateDozePoseNumbers()
+    {
+        if (configuration.Version >= 2)
+            return;
+
+        var dozeName = emoteData.GetPoseTypeInfo(4)?.Name;
+        var changed = 0;
+        foreach (var emote in configuration.RootFolder.EnumerateEmotes())
+        {
+            foreach (var cmd in emote.Commands)
+            {
+                if (dozeName == null || cmd.PoseIndex < 1 || emoteData.GetPoseType(cmd.Command) != 4 ||
+                    cmd.Name != $"{dozeName} Pose {cmd.PoseIndex}")
+                    continue;
+
+                var file = configuration.Version == 0 ? cmd.PoseIndex - 1 : cmd.PoseIndex;
+                if (file < 1 || emoteData.GetPoseForAnimationKey($"emote/l_pose{file:00}_loop") is not { PoseType: 4 } pose)
+                    continue;
+
+                var newIndex = pose.Pose + 1;
+                if (newIndex == cmd.PoseIndex)
+                    continue;
+
+                cmd.PoseIndex = newIndex;
+                cmd.Name = $"{dozeName} Pose {newIndex}";
+                changed++;
+            }
+        }
+
+        if (changed > 0)
+            log.Information($"Renumbered {changed} doze pose row(s) to the game's pose order.");
+        configuration.Version = 2;
+        configuration.Save();
     }
 
     /// <summary> Add a fully built emote entry (e.g. from the mod scanner). </summary>
@@ -150,70 +213,317 @@ public class EmoteManager : IDisposable
             return;
         }
 
+        StartTrace($"Use '{emote.Name}' row '{cmd.Name}' {cmd.Command} pose={cmd.PoseIndex} autoToggle={emote.AutoToggleMod} mods={emote.AssociatedMods.Count}");
+
         // An anim-locked preview would block the real emote
         StopPreview();
+        pendingPose = null;
+        StopTransitionSkip();
 
-        // Remove previous emote's temporary mod settings before applying new ones
+        var poseType = emoteData.GetPoseType(cmd.Command);
+        // Seated/dozing in this command's own stance (standing idle is not a stance to keep)
+        var inStance = poseType is not null and not 0 && GetStancePoseIndex(poseType.Value) != null;
+
+        var redraw = false;
         if (emote.AutoToggleMod)
         {
             var lastCmd = lastUsedCommand?.TrimStart('/');
             var normalizedCmd = cmd.Command.TrimStart('/');
-            var needsRedraw = configuration.AlwaysRedraw ||
-                (lastCmd != null && lastCmd.Equals(normalizedCmd, StringComparison.OrdinalIgnoreCase));
+            var sameCommand = lastCmd != null && lastCmd.Equals(normalizedCmd, StringComparison.OrdinalIgnoreCase);
+            var newEmote = lastUsedEmote?.Id != emote.Id;
 
-            if (lastUsedEmote != null && lastUsedEmote.Id != emote.Id)
-                DisableEmoteMods(lastUsedEmote, skipRedraw: !needsRedraw);
+            // Remove previous emote's temporary mod settings before applying new ones
+            if (lastUsedEmote != null && newEmote)
+                DisableEmoteMods(lastUsedEmote, skipRedraw: true);
 
             ApplyAssociatedMods(emote);
 
             lastUsedEmote = emote;
             lastUsedCommand = cmd.Command;
 
-            // Only redraw if the previous emote used the same command (same animation source)
-            if (needsRedraw)
-            {
-                penumbraService.RedrawSelf();
-            }
+            // A redraw reloads animations the character already has loaded: needed when the
+            // previous emote used the same command (same animation files), or when another
+            // emote's mods replace the stance animation playing right now. A pose change within
+            // the same emote loads a different file, so it skips the redraw (and its disruption).
+            redraw = configuration.AlwaysRedraw || (inStance ? newEmote : sameCommand);
         }
 
-        var poseType = cmd.PoseIndex > 0 ? emoteData.GetPoseType(cmd.Command) : null;
+        Trace($"Decision: poseType={poseType?.ToString() ?? "none"} inStance={inStance} redraw={redraw}");
 
-        // Only switch the pose (no command sent) when already in the target stance —
-        // re-sending the emote would cancel it (e.g. /doze while dozing stands up) —
-        // or for standing idle poses, where /changepose IS the cycle command and
-        // sending it raw would move the pose before the watcher corrects it.
-        var currentPoseType = GetLocalPoseState()?.PoseType;
-        if (poseType != null && (poseType.Value == 0 || currentPoseType == poseType.Value))
+        // Play on a later frame: after Penumbra has applied the settings, and after the redraw
+        // has finished — an emote started underneath a redraw gets cancelled by it
+        var now = DateTime.UtcNow;
+        pendingPlay = new PendingPlay
         {
-            QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
-            log.Information(currentPoseType == poseType.Value
-                ? $"Used emote: {emote.Name} (pose change to {cmd.PoseIndex})"
-                : $"Emote {emote.Name}: idle pose {cmd.PoseIndex} queued — applies when standing (5s timeout).");
+            Emote = emote,
+            Command = cmd,
+            WaitingForRedraw = redraw && penumbraService.RedrawSelf(),
+            NotBefore = now,
+            Deadline = now + RedrawTimeout,
+        };
+    }
+
+    // An emote waiting for its turn to play, see UseEmote
+    private PendingPlay? pendingPlay;
+
+    private sealed class PendingPlay
+    {
+        public required EmoteEntry Emote;
+        public required EmoteCommandEntry Command;
+        public bool WaitingForRedraw;
+        public DateTime NotBefore;
+        // Play anyway when the redraw-finished event never arrives
+        public DateTime Deadline;
+    }
+
+    // Let the freshly redrawn character settle before the emote starts
+    private static readonly TimeSpan RedrawSettle = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan RedrawTimeout = TimeSpan.FromSeconds(3);
+
+    private void OnLocalPlayerRedrawn()
+    {
+        if (pendingPlay is not { WaitingForRedraw: true } play)
+            return;
+
+        play.WaitingForRedraw = false;
+        play.NotBefore = DateTime.UtcNow + RedrawSettle;
+        Trace("Penumbra reports redraw finished.");
+    }
+
+    private void PlayEmote(EmoteEntry emote, EmoteCommandEntry cmd)
+    {
+        var poseType = emoteData.GetPoseType(cmd.Command);
+
+        // Standing idle pose rows never send /changepose raw: it IS the cycle command,
+        // and sending it would move the pose before the watcher corrects it
+        if (poseType == 0)
+        {
+            if (cmd.PoseIndex > 0)
+            {
+                QueuePoseChange(0, (byte)(cmd.PoseIndex - 1));
+                log.Information($"Emote {emote.Name}: idle pose {cmd.PoseIndex} queued — applies when standing (5s timeout).");
+            }
+            else
+            {
+                PlayCommand(emote, cmd);
+            }
             return;
         }
 
+        if (poseType == null)
+        {
+            PlayCommand(emote, cmd);
+            return;
+        }
+
+        // A plain /doze row is the standing doze emote, not one of the lying doze poses
+        if (poseType == 4 && cmd.PoseIndex == 0)
+        {
+            PlayCommand(emote, cmd);
+            return;
+        }
+
+        // Sit/groundsit/doze. The game enters the stance in the pose it remembers (the last
+        // one used), so a row without a pose number means pose 1 — the base animation mods replace
+        var stance = poseType.Value;
+        var targetIndex = (byte)(Math.Max(cmd.PoseIndex, 1) - 1);
+
+        // Already in this stance (checked after any redraw, which reloaded the animation)
+        var currentIndex = GetStancePoseIndex(stance);
+        if (currentIndex != null)
+        {
+            if (currentIndex == targetIndex)
+            {
+                log.Information($"Used emote: {emote.Name} (already in pose {targetIndex + 1})");
+                return;
+            }
+
+            // Only /cpose changes the pose the character is in: a hidden pose emote merely plays
+            // that pose's transition and falls back to the current pose. The watcher primes the
+            // remembered pose so a single /cpose lands on the target.
+            QueuePoseChange(stance, targetIndex, alreadyInStance: true);
+            StartTransitionSkip(stance, targetIndex);
+            log.Information($"Used emote: {emote.Name} (already in stance, /cpose to pose {targetIndex + 1})");
+            return;
+        }
+
+        EnterStance(emote, cmd, stance, targetIndex);
+    }
+
+    /// <summary> Enter a sit/groundsit/doze stance directly in the target pose. </summary>
+    private void EnterStance(EmoteEntry emote, EmoteCommandEntry cmd, byte stance, byte targetIndex)
+    {
+        SetRememberedPose(stance, targetIndex);
+
+        // With Sit/Doze Anywhere, play the hidden emote of exactly this pose. The generic
+        // anywhere emote is a fixed pose (e.g. 99 = doze pose 3): the game lies down, then
+        // switches into that pose a few seconds later, away from the pose the mod replaces.
+        var poseEmote = configuration.SitDozeAnywhere ? emoteData.GetPoseEmoteId(stance, targetIndex) : null;
+        if (poseEmote != null)
+        {
+            ExecuteHotbarEmote(poseEmote.Value);
+            Trace($"Executed pose emote {poseEmote.Value} (pose {targetIndex + 1}).");
+            log.Information($"Used emote: {emote.Name} (pose {targetIndex + 1} via emote {poseEmote.Value})");
+        }
+        else
+        {
+            PlayCommand(emote, cmd);
+        }
+
+        // /cpose once seated if the game lands elsewhere — and, when skipping transitions, to cut
+        // lying awake short: dozing via a pose emote lies awake ~5s before falling asleep into
+        // the remembered pose, while a /cpose sends it there right away
+        if (configuration.AutoPoseCorrection || configuration.SkipPoseTransitions)
+            QueuePoseChange(stance, targetIndex);
+
+        StartTransitionSkip(stance, targetIndex);
+    }
+
+    // Local-only replacement of a stance's pose-change transitions with the target pose's loop
+    private TransitionSkip? transitionSkip;
+
+    private sealed class TransitionSkip
+    {
+        public required byte Stance;
+        public required byte TargetIndex;
+        public required ushort TargetLoop;
+        public required string TargetLoopKey;
+        public required uint ModeRow;
+        // The stance's mode must be entered by then, or skipping is abandoned
+        public DateTime EnterDeadline;
+        public bool Entered;
+        // Slot 0 timeline and emote seen last tick: swap once per started transition
+        public (ushort Timeline, ushort Emote) LastSeen;
+    }
+
+    private static readonly TimeSpan TransitionSkipEnterTimeout = TimeSpan.FromSeconds(4);
+
+    private void StartTransitionSkip(byte stance, byte targetIndex)
+    {
+        StopTransitionSkip();
+        if (!configuration.SkipPoseTransitions)
+            return;
+
+        var loop = emoteData.GetPoseLoopTimeline(stance, targetIndex);
+        var modeRow = emoteData.GetStanceModeRow(stance);
+        if (loop == null || modeRow == null)
+            return;
+
+        transitionSkip = new TransitionSkip
+        {
+            Stance = stance,
+            TargetIndex = targetIndex,
+            TargetLoop = loop.Value.Id,
+            TargetLoopKey = loop.Value.Key,
+            ModeRow = modeRow.Value,
+            EnterDeadline = DateTime.UtcNow + TransitionSkipEnterTimeout,
+        };
+    }
+
+    private void StopTransitionSkip(string? reason = null)
+    {
+        if (transitionSkip == null)
+            return;
+
+        transitionSkip = null;
+        if (reason != null)
+            Trace($"Transition skip stopped: {reason}.");
+    }
+
+    /// <summary>
+    /// Per tick while a sit/groundsit/doze pose is being entered or held: when the game starts a
+    /// pose-change transition (e.g. emote/l_pose01_start), play the target pose's loop instead —
+    /// a one-off client-side timeline swap like the preview, so other players are unaffected.
+    /// Lying awake is not swapped (the game re-asserts it every frame); the /cpose watcher ends
+    /// it instead. Stops when the stance is left, or when the player changes the pose themselves.
+    /// </summary>
+    private unsafe void WatchTransitionSkip()
+    {
+        var skip = transitionSkip;
+        if (skip == null)
+            return;
+
+        var chara = GetLocalCharacter();
+        if (chara == null)
+        {
+            transitionSkip = null;
+            return;
+        }
+
+        var inMode = chara->Mode == FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes.InPositionLoop &&
+                     chara->ModeParam == skip.ModeRow;
+        if (!inMode)
+        {
+            if (skip.Entered || DateTime.UtcNow > skip.EnterDeadline)
+                StopTransitionSkip("stance left");
+            return;
+        }
+
+        skip.Entered = true;
+
+        // A manual /cpose to another pose: stop forcing the old one
+        var ec = &chara->EmoteController;
+        if (pendingPose == null && (byte)ec->CurrentPoseType == skip.Stance && ec->CPoseState != skip.TargetIndex)
+        {
+            StopTransitionSkip($"pose changed to {ec->CPoseState + 1} by the player");
+            return;
+        }
+
+        var current = chara->Timeline.TimelineSequencer.TimelineIds[0];
+        var seen = (current, ec->EmoteId);
+        var isNew = seen != skip.LastSeen;
+        skip.LastSeen = seen;
+        if (!isNew || current == 0 || current == skip.TargetLoop)
+            return;
+
+        var key = emoteData.GetStanceTransitionKey(skip.Stance, current);
+        if (key == null)
+            return;
+
+        chara->Timeline.TimelineSequencer.PlayTimeline(skip.TargetLoop, null);
+        Trace($"Transition skip: {key} -> {skip.TargetLoopKey}");
+    }
+
+    private static string NormalizeChatCommand(string command)
+        => command.StartsWith('/') ? command : "/" + command;
+
+    private void PlayCommand(EmoteEntry emote, EmoteCommandEntry cmd)
+    {
         // With Sit/Doze Anywhere enabled, execute the game's hidden furniture emote
         // instead of the chat command, so sit/doze work without a chair or bed nearby.
         var anywhereId = configuration.SitDozeAnywhere ? emoteData.GetAnywhereEmoteId(cmd.Command) : null;
         if (anywhereId != null)
         {
             ExecuteHotbarEmote(anywhereId.Value);
+            Trace($"Executed hidden anywhere emote {anywhereId.Value}.");
             log.Information($"Used emote: {emote.Name} (anywhere emote {anywhereId.Value})");
         }
         else
         {
             // Send the emote command via chat
-            var command = cmd.Command;
-            if (!command.StartsWith('/'))
-                command = "/" + command;
-
+            var command = NormalizeChatCommand(cmd.Command);
             SendChatCommand(command);
             log.Information($"Used emote: {emote.Name} ({command})");
         }
+    }
 
-        // Once the stance is entered, cycle /cpose to the requested pose
-        if (poseType != null)
-            QueuePoseChange(poseType.Value, (byte)(cmd.PoseIndex - 1));
+    /// <summary>
+    /// Set the pose the game remembers for a stance (PlayerState.SelectedPoses, what /cpose
+    /// advances) — the next sit/groundsit/doze enters that pose directly.
+    /// </summary>
+    private unsafe void SetRememberedPose(byte poseType, byte index)
+    {
+        var playerState = PlayerState.Instance();
+        if (playerState == null)
+            return;
+
+        var maxIndex = (int)EmoteController.GetAvailablePoses((EmoteController.PoseType)poseType);
+        var value = (byte)Math.Min(index, maxIndex);
+        var previous = playerState->SelectedPoses[poseType];
+        playerState->SelectedPoses[poseType] = value;
+        if (previous != value)
+            log.Debug($"Remembered pose for type {poseType}: {previous + 1} -> {value + 1}.");
+        Trace($"Set remembered pose type {poseType}: {previous + 1} -> {value + 1} (now reads {playerState->SelectedPoses[poseType] + 1}).");
     }
 
     // Saved character state while a local preview is running (mode, mode param, base override)
@@ -246,8 +556,11 @@ public class EmoteManager : IDisposable
 
         var chara = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
 
-        // A queued pose change must not fire /cpose into the anim lock
+        // A queued emote or pose change must not fire into the anim lock
+        pendingPlay = null;
         pendingPose = null;
+        // Before the preview saves the base override — it must not capture ours
+        StopTransitionSkip();
 
         // Track preview-applied mods exactly like a real use, so the next
         // emote's cleanup pass removes them
@@ -346,6 +659,101 @@ public class EmoteManager : IDisposable
         return (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)localPlayer.Address;
     }
 
+    // Diagnostic trace (Configuration.TraceEmotes): state changes for a while after an emote use
+    private static readonly TimeSpan TraceDuration = TimeSpan.FromSeconds(20); // dozing falls asleep after ~9s
+    private DateTime traceStart;
+    private DateTime traceUntil;
+    private string? lastTraceState;
+    private readonly HashSet<ushort> tracedTimelines = new();
+
+    private void StartTrace(string message)
+    {
+        if (!configuration.TraceEmotes)
+            return;
+
+        traceStart = DateTime.UtcNow;
+        traceUntil = traceStart + TraceDuration;
+        lastTraceState = null;
+        tracedTimelines.Clear();
+        Trace(message);
+    }
+
+    private void Trace(string message)
+    {
+        if (DateTime.UtcNow > traceUntil)
+            return;
+
+        log.Information($"[Trace +{(DateTime.UtcNow - traceStart).TotalMilliseconds:0}ms] {message}");
+    }
+
+    /// <summary> Per tick while tracing: log the character state whenever it changes. </summary>
+    private unsafe void WatchTrace()
+    {
+        if (traceUntil == default)
+            return;
+
+        if (DateTime.UtcNow > traceUntil)
+        {
+            traceUntil = default;
+            log.Information("[Trace] end");
+            return;
+        }
+
+        var chara = GetLocalCharacter();
+        if (chara == null)
+            return;
+
+        var ec = &chara->EmoteController;
+        var playerState = PlayerState.Instance();
+        var remembered = playerState == null
+            ? "?"
+            : $"sit {playerState->SelectedPoses[2] + 1}, ground {playerState->SelectedPoses[3] + 1}, doze {playerState->SelectedPoses[4] + 1}";
+
+        var timelines = new List<string>();
+        var ids = chara->Timeline.TimelineSequencer.TimelineIds;
+        for (var i = 0; i < ids.Length; i++)
+        {
+            if (ids[i] != 0)
+                timelines.Add($"{i}:{ids[i]} {emoteData.GetTimelineKey(ids[i]) ?? "?"}");
+        }
+
+        var state = $"stance={ec->CurrentPoseType} cpose={ec->CPoseState + 1} remembered=[{remembered}] " +
+                    $"mode={chara->Mode}/{chara->ModeParam} emote={ec->EmoteId} loop={ec->IsInEmoteLoop()} " +
+                    $"baseOverride={chara->Timeline.BaseOverride} timelines=[{string.Join(", ", timelines)}]";
+        if (state != lastTraceState)
+        {
+            lastTraceState = state;
+            Trace(state);
+        }
+
+        // Which file Penumbra loads for each newly seen animation — shows whether the mod applies
+        var race = GetLocalRaceCode(chara);
+        for (var i = 0; i < ids.Length; i++)
+        {
+            if (ids[i] == 0 || !tracedTimelines.Add(ids[i]))
+                continue;
+
+            var key = emoteData.GetTimelineKey(ids[i]);
+            if (key == null || race == null)
+                continue;
+
+            var gamePath = $"chara/human/c{race.Value:0000}/animation/a0001/bt_common/{key}.pap";
+            var resolved = penumbraService.ResolvePlayerPath(gamePath);
+            Trace($"File for {key}: {(resolved == null ? "(Penumbra unavailable)" : resolved.Equals(gamePath, StringComparison.OrdinalIgnoreCase) ? "vanilla " + gamePath : resolved)}");
+        }
+    }
+
+    /// <summary> The local character's race/sex model code (e.g. 101 = c0101), or null. </summary>
+    private static unsafe ushort? GetLocalRaceCode(FFXIVClientStructs.FFXIV.Client.Game.Character.Character* chara)
+    {
+        var drawObject = (FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase*)chara->DrawObject;
+        if (drawObject == null ||
+            drawObject->GetModelType() != FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase.ModelType.Human)
+            return null;
+
+        return ((FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Human*)drawObject)->RaceSexId;
+    }
+
     /// <summary> Execute an emote by id through the hotbar module's scratch slot. </summary>
     private static unsafe void ExecuteHotbarEmote(uint emoteId)
     {
@@ -359,8 +767,38 @@ public class EmoteManager : IDisposable
         hotbarModule->ScratchSlot.Set(RaptureHotbarModule.HotbarSlotType.Empty, 0);
     }
 
-    private void QueuePoseChange(byte poseType, byte targetIndex)
-        => pendingPose = (poseType, targetIndex, DateTime.UtcNow.AddSeconds(5));
+    private void QueuePoseChange(byte poseType, byte targetIndex, bool alreadyInStance = false)
+        => pendingPose = new PendingPose
+        {
+            PoseType = poseType,
+            TargetIndex = targetIndex,
+            Deadline = DateTime.UtcNow.AddSeconds(5),
+            // Already settled in the stance — no need to wait for a sit-down to finish
+            InStanceSince = alreadyInStance ? DateTime.UtcNow - PoseStanceSettle : null,
+        };
+
+    /// <summary>
+    /// The current 0-based pose index when the local player is in this sit/groundsit/doze
+    /// stance, or null when not. Lying in bed awake (doze pose 1) is the bed mode without the
+    /// Doze pose type, so the stance's emote mode counts too.
+    /// </summary>
+    private unsafe byte? GetStancePoseIndex(byte stance)
+    {
+        var chara = GetLocalCharacter();
+        if (chara == null)
+            return null;
+
+        if ((byte)chara->EmoteController.CurrentPoseType == stance)
+            return chara->EmoteController.CPoseState;
+
+        var modeRow = emoteData.GetStanceModeRow(stance);
+        if (modeRow != null &&
+            chara->Mode == FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes.InPositionLoop &&
+            chara->ModeParam == modeRow)
+            return 0;
+
+        return null;
+    }
 
     /// <summary> The local player's current pose stance and pose index, or null when unavailable. </summary>
     private unsafe (byte PoseType, byte PoseIndex)? GetLocalPoseState()
@@ -375,43 +813,97 @@ public class EmoteManager : IDisposable
 
     /// <summary>
     /// Applies a queued pose change once the character has entered the target stance:
-    /// sends /cpose the exact number of times needed to land on the requested pose
-    /// (the approach used by pose plugins — the game offers no direct set).
+    /// cycles /cpose until the requested pose is reached (the approach used by pose
+    /// plugins — the game offers no direct set). One /cpose per step: the game drops
+    /// /cpose while the sit-down or a pose transition is still playing, so each step
+    /// waits for the pose index to change and resends when it didn't.
     /// </summary>
     private void OnFrameworkUpdate(IFramework _)
     {
         WatchPreview();
+        WatchTrace();
+        WatchTransitionSkip();
 
-        if (pendingPose == null)
+        var play = pendingPlay;
+        if (play != null && (!play.WaitingForRedraw || DateTime.UtcNow > play.Deadline) && DateTime.UtcNow >= play.NotBefore)
+        {
+            pendingPlay = null;
+            Trace(play.WaitingForRedraw ? "Playing (redraw event never arrived, timeout)." : "Playing.");
+            PlayEmote(play.Emote, play.Command);
+        }
+
+
+        var pose = pendingPose;
+        if (pose == null)
             return;
 
-        var (poseType, targetIndex, deadline) = pendingPose.Value;
-        if (DateTime.UtcNow > deadline)
+        var now = DateTime.UtcNow;
+        if (now > pose.Deadline)
         {
+            log.Debug($"Pose change to {pose.TargetIndex + 1} (type {pose.PoseType}) timed out.");
+            Trace($"/cpose watcher timed out (target pose {pose.TargetIndex + 1}).");
             pendingPose = null;
             return;
         }
 
-        var state = GetLocalPoseState();
-        if (state == null || state.Value.PoseType != poseType)
+        // Sit/groundsit/doze count lying awake (bed mode, before dozing off) as pose 1
+        byte? stanceIndex;
+        if (pose.PoseType == 0)
+        {
+            var state = GetLocalPoseState();
+            stanceIndex = state?.PoseType == 0 ? state.Value.PoseIndex : null;
+        }
+        else
+        {
+            stanceIndex = GetStancePoseIndex(pose.PoseType);
+        }
+
+        if (stanceIndex == null)
+        {
+            pose.InStanceSince = null;
             return; // stance not entered yet — keep waiting until the deadline
+        }
+
+        // The sit-down plays first and the pose index can lag behind the stance —
+        // acting on it right away cycles away from a correctly entered pose
+        pose.InStanceSince ??= now;
+        if (pose.SentFromIndex == null && now - pose.InStanceSince < PoseStanceSettle)
+            return;
 
         // Per Poser: GetAvailablePoses returns the highest valid pose index
-        var totalPoses = EmoteController.GetAvailablePoses((EmoteController.PoseType)poseType) + 1;
-        var current = state.Value.PoseIndex;
-        var target = Math.Min(targetIndex, totalPoses - 1);
+        var totalPoses = EmoteController.GetAvailablePoses((EmoteController.PoseType)pose.PoseType) + 1;
+        var current = stanceIndex.Value;
+        var target = Math.Min(pose.TargetIndex, totalPoses - 1);
 
-        var steps = ((target - current) % totalPoses + totalPoses) % totalPoses;
-        for (var i = 0; i < steps; i++)
-            SendChatCommand("/cpose");
+        if (current == target)
+        {
+            if (pose.SentFromIndex != null)
+                log.Debug($"Reached pose {target + 1} (type {pose.PoseType}).");
+            Trace($"/cpose watcher: in pose {target + 1}.");
+            pendingPose = null;
+            return;
+        }
 
-        if (steps > 0)
-            log.Debug($"Cycled /cpose {steps}x to pose {target + 1} (type {poseType}).");
-        pendingPose = null;
+        // Previous step still pending — give it time to land before resending
+        if (pose.SentFromIndex == current && now - pose.SentAt < PoseStepRetry)
+            return;
+
+        // Extend the deadline on the first step and on progress, never on a resend,
+        // so a /cpose the game keeps refusing can't retry forever
+        if (pose.SentFromIndex != current)
+            pose.Deadline = now.AddSeconds(4);
+
+        // /cpose advances from the REMEMBERED pose, not the current one: prime it with the pose
+        // before the target so this single /cpose lands on the target directly
+        SetRememberedPose(pose.PoseType, (byte)((target + totalPoses - 1) % totalPoses));
+        SendChatCommand("/cpose");
+        pose.SentFromIndex = current;
+        pose.SentAt = now;
     }
 
-    private static unsafe void SendChatCommand(string command)
+    private unsafe void SendChatCommand(string command)
     {
+        Trace($"Send chat command {command}");
         var uiModule = UIModule.Instance();
         if (uiModule == null) return;
 

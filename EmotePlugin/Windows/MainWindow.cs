@@ -555,7 +555,9 @@ public class MainWindow : Window, IDisposable
             plugin.Configuration.Save();
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Play /sit and /doze commands using the game's hidden furniture emote,\nso they work without a chair or bed nearby.");
+            ImGui.SetTooltip("Play /sit and /doze commands using the game's hidden furniture emotes,\n" +
+                             "so they work without a chair or bed nearby. Sit, ground sit and doze rows\n" +
+                             "play the hidden emote of their exact pose (doze pose 1 = lying in bed awake).");
 
         if (sitDozeAnywhere)
         {
@@ -567,6 +569,40 @@ public class MainWindow : Window, IDisposable
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Other players see this non-standard behavior (sitting in mid-air,\ndozing on bare ground). Use with discretion in public areas.");
         }
+
+        var autoPoseCorrection = plugin.Configuration.AutoPoseCorrection;
+        if (ImGui.Checkbox("Correct Sit/Doze Pose with /cpose", ref autoPoseCorrection))
+        {
+            plugin.Configuration.AutoPoseCorrection = autoPoseCorrection;
+            plugin.Configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Off (recommended): sitting down / dozing enters the selected pose directly,\n" +
+                             "with no /cpose afterwards.\n" +
+                             "On: also send /cpose automatically if the game lands on a different pose.\n" +
+                             "Switching pose while already seated or dozing always uses /cpose.");
+
+        var skipTransitions = plugin.Configuration.SkipPoseTransitions;
+        if (ImGui.Checkbox("Skip Sit/Doze Pose Transitions", ref skipTransitions))
+        {
+            plugin.Configuration.SkipPoseTransitions = skipTransitions;
+            plugin.Configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("When a sit, ground sit or doze row is used, go straight to the selected pose's loop:\n" +
+                             "pose change transitions (and lying awake before dozing off) are replaced as they start.\n" +
+                             "Only on your screen — other players still see the game's transitions.");
+
+        var traceEmotes = plugin.Configuration.TraceEmotes;
+        if (ImGui.Checkbox("Trace Emote Playback", ref traceEmotes))
+        {
+            plugin.Configuration.TraceEmotes = traceEmotes;
+            plugin.Configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Diagnostics: for 20 seconds after each emote, log every change of stance, pose,\n" +
+                             "character mode and playing animation (with the file Penumbra loads for it)\n" +
+                             "to /xllog, prefixed with [Trace].");
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -1824,7 +1860,13 @@ public class MainWindow : Window, IDisposable
     // cpose variant animation files: emote/pose0N = standing idle, s_ = chair sit,
     // j_ = ground sit, l_ = doze, b_ = weapon drawn (no playable command — skipped)
     private static readonly Regex PoseFileRegex = new(
-        @"emote/(s_|j_|l_|b_)?pose(\d{2})_(?:loop|start)\.pap",
+        @"emote/(?:(s_|j_|l_|b_)?pose(\d{2})_(?:loop|start)|bed_liedown_(?:loop|start))\.pap",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // A replaced game path's emote timeline key (e.g. ".../bt_common/emote/l_pose01_loop.pap"
+    // -> "emote/l_pose01_loop")
+    private static readonly Regex EmoteAnimationKeyRegex = new(
+        @"bt_common/(emote/[^""/\\]+)\.pap",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     // Any emote animation file (.pap under an emote path). Distinguishes an actual
@@ -1915,11 +1957,17 @@ public class MainWindow : Window, IDisposable
         if (!Directory.Exists(modDir))
             return false;
 
-        // Only the option files list replaced game paths — skip meta.json and friends
+        // The option files list the replaced game paths
         IEnumerable<string> optionFiles = Directory.EnumerateFiles(modDir, "group_*.json", SearchOption.TopDirectoryOnly);
         var defaultMod = Path.Combine(modDir, "default_mod.json");
         if (File.Exists(defaultMod))
             optionFiles = optionFiles.Append(defaultMod);
+
+        // Newer Penumbra mods keep their default files and option groups inside meta.json
+        // (DefaultData / Groups) instead of separate files
+        var meta = Path.Combine(modDir, "meta.json");
+        if (File.Exists(meta))
+            optionFiles = optionFiles.Append(meta);
 
         var hasEmoteAnimation = false;
         foreach (var jsonFile in optionFiles)
@@ -1937,30 +1985,20 @@ public class MainWindow : Window, IDisposable
             if (!hasEmoteAnimation && EmoteAnimationRegex.IsMatch(text))
                 hasEmoteAnimation = true;
 
-            foreach (Match match in PoseFileRegex.Matches(text))
+            // Which pose each replaced animation plays, per the game's own pose tables
+            foreach (Match match in EmoteAnimationKeyRegex.Matches(text))
             {
-                byte? poseType = match.Groups[1].Value.ToLowerInvariant() switch
-                {
-                    "" => 0,   // standing idle (/changepose)
-                    "s_" => 2, // chair sit
-                    "j_" => 3, // ground sit
-                    "l_" => 4, // doze
-                    _ => null, // b_ = weapon drawn — no playable command
-                };
-                if (poseType == null)
+                if (emoteIconHelper.GetPoseForAnimationKey(match.Groups[1].Value) is not { } pose)
                     continue;
 
-                var info = emoteIconHelper.GetPoseTypeInfo(poseType.Value);
+                var info = emoteIconHelper.GetPoseTypeInfo(pose.PoseType);
                 if (info == null)
                     continue;
 
-                // File pose0N replaces cpose index N; our PoseIndex is 1-based
-                if (!int.TryParse(match.Groups[2].Value, out var fileIndex))
-                    continue;
-
-                var pose = fileIndex + 1;
-                var baseName = poseType.Value == 0 ? "Idle" : info.Value.Name;
-                detected.TryAdd((info.Value.Command, pose), $"{baseName} Pose {pose}");
+                // Our PoseIndex is 1-based
+                var poseNumber = pose.Pose + 1;
+                var baseName = pose.PoseType == 0 ? "Idle" : info.Value.Name;
+                detected.TryAdd((info.Value.Command, poseNumber), $"{baseName} Pose {poseNumber}");
             }
         }
 

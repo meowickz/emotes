@@ -29,15 +29,20 @@ public class PenumbraService : IDisposable
     private readonly GetCurrentModSettingsWithTemp getCurrentModSettings;
     private readonly EventSubscriber penumbraInitialized;
     private readonly EventSubscriber penumbraDisposed;
+    private readonly EventSubscriber<nint, int> gameObjectRedrawn;
     private readonly SetTemporaryModSettings setTemporaryModSettings;
     private readonly RemoveTemporaryModSettings removeTemporaryModSettings;
     private readonly RemoveAllTemporaryModSettings removeAllTemporaryModSettings;
     private readonly OpenMainWindow openMainWindow;
     private readonly RedrawObject redrawObject;
+    private readonly ResolvePlayerPath resolvePlayerPath;
 
     private readonly HashSet<Guid> usedCollections = new();
 
     public bool Available { get; private set; }
+
+    /// <summary> Raised when Penumbra has finished redrawing the local player. </summary>
+    public event Action? LocalPlayerRedrawn;
 
     public PenumbraService(IDalamudPluginInterface pi, IPluginLog log)
     {
@@ -59,10 +64,16 @@ public class PenumbraService : IDisposable
         removeAllTemporaryModSettings = new RemoveAllTemporaryModSettings(pi);
         openMainWindow = new OpenMainWindow(pi);
         redrawObject = new RedrawObject(pi);
+        resolvePlayerPath = new ResolvePlayerPath(pi);
 
         // Recover when Penumbra loads after this plugin or reloads mid-session
         penumbraInitialized = Initialized.Subscriber(pi, CheckAvailability);
         penumbraDisposed = Disposed.Subscriber(pi, () => Available = false);
+        gameObjectRedrawn = GameObjectRedrawn.Subscriber(pi, (_, index) =>
+        {
+            if (index == 0)
+                LocalPlayerRedrawn?.Invoke();
+        });
 
         CheckAvailability();
     }
@@ -301,16 +312,37 @@ public class PenumbraService : IDisposable
         }
     }
 
-    public void RedrawSelf()
+    /// <summary>
+    /// The file Penumbra loads for a game path on the local player (the game path itself when
+    /// unmodded), or null when unavailable.
+    /// </summary>
+    public string? ResolvePlayerPath(string gamePath)
     {
-        if (!Available) return;
+        if (!Available) return null;
+        try
+        {
+            return resolvePlayerPath.Invoke(gamePath);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary> Request a redraw of the local player. Returns whether it was requested. </summary>
+    public bool RedrawSelf()
+    {
+        if (!Available) return false;
         try
         {
             redrawObject.Invoke(0, RedrawType.Redraw); // 0 = local player
+            log.Debug("Redraw requested for the local player.");
+            return true;
         }
         catch (Exception ex)
         {
             log.Error($"Failed to redraw: {ex.Message}");
+            return false;
         }
     }
 
@@ -318,6 +350,7 @@ public class PenumbraService : IDisposable
     {
         penumbraInitialized.Dispose();
         penumbraDisposed.Dispose();
+        gameObjectRedrawn.Dispose();
 
         // Clean up all temporary settings we applied across all collections
         try

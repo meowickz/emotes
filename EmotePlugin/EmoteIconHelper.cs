@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
+using System.Text.RegularExpressions;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Textures;
 using Dalamud.Plugin.Services;
@@ -15,6 +17,7 @@ public class EmoteIconHelper
     private const uint ChangePoseEmoteRowId = 90;
     private const uint GroundSitEmoteModeRowId = 1;
     private const uint ChairSitEmoteModeRowId = 2;
+    private const uint BedEmoteModeRowId = 3; // lying in bed: doze poses
 
     // Hidden emote ids the game uses internally for furniture interactions —
     // executing them plays sit/doze without requiring a chair/bed.
@@ -34,11 +37,34 @@ public class EmoteIconHelper
     private readonly Dictionary<string, ushort> commandTimelines = new(System.StringComparer.OrdinalIgnoreCase);
     // ActionTimeline key (e.g. "emote/l_pose02_loop") -> row id, for pose-variant previews
     private readonly Dictionary<string, ushort> poseLoopTimelines = new(System.StringComparer.OrdinalIgnoreCase);
+    // EmoteController.PoseType -> the game's pose table for that stance, by 0-based pose index
+    private readonly Dictionary<byte, List<StancePose>> stancePoses = new();
+    // Stance animation key (e.g. "emote/l_pose01_loop") -> (stance, 0-based pose index)
+    private readonly Dictionary<string, (byte PoseType, byte Pose)> stancePoseKeys = new(System.StringComparer.OrdinalIgnoreCase);
+
+    private readonly record struct StancePose(uint EmoteId, bool HasTextCommand, ushort LoopTimeline, string? LoopKey);
+
+    // Stance -> every ActionTimeline row of its pose-change transitions (the intros of poses 2+,
+    // e.g. emote/l_pose01_start) -> key. Several rows can share one key.
+    private readonly Dictionary<byte, Dictionary<ushort, string>> stanceTransitions = new();
+
+    // EmoteMode row of each stance -> EmoteController.PoseType
+    private static readonly Dictionary<uint, byte> StanceModes = new()
+    {
+        [ChairSitEmoteModeRowId] = 2,
+        [GroundSitEmoteModeRowId] = 3,
+        [BedEmoteModeRowId] = 4,
+    };
+
+    // Standing idle pose files: emote/pose0N = /changepose pose index N
+    private static readonly Regex IdlePoseKeyRegex = new(@"^emote/pose(\d{2})_(?:loop|start)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly ITextureProvider textureProvider;
+    private readonly IDataManager dataManager;
 
     public EmoteIconHelper(ITextureProvider textureProvider, IDataManager dataManager)
     {
         this.textureProvider = textureProvider;
+        this.dataManager = dataManager;
         BuildCache(dataManager);
     }
 
@@ -60,6 +86,8 @@ public class EmoteIconHelper
 
         var emoteSheet = dataManager.GetExcelSheet<Emote>();
         if (emoteSheet == null) return;
+
+        BuildPoseTables(emoteSheet);
 
         foreach (var emote in emoteSheet)
         {
@@ -120,6 +148,131 @@ public class EmoteIconHelper
     }
 
     /// <summary>
+    /// Build each stance's pose table the way the game orders it: the mode's start emote is
+    /// pose index 0, then the mode's hidden furniture emotes by row id (the end emote excluded).
+    /// File names do NOT give the order — doze is 88 bed_liedown (awake), 99 l_pose02,
+    /// 100 l_pose01, confirmed by traces: remembered doze index 1 falls asleep into 99.
+    /// Sit (50 sit, 95..255 s_pose01..04) and ground sit (52 jmn, 97..117 j_pose01..03)
+    /// happen to match their file numbers.
+    /// </summary>
+    private void BuildPoseTables(Lumina.Excel.ExcelSheet<Emote> emoteSheet)
+    {
+        var modeSheet = dataManager.GetExcelSheet<EmoteMode>();
+        if (modeSheet == null)
+            return;
+
+        var transitionKeys = new Dictionary<string, byte>(System.StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (modeId, poseType) in StanceModes)
+        {
+            if (modeSheet.GetRowOrDefault(modeId) is not { } mode)
+                continue;
+
+            var startId = mode.StartEmote.RowId;
+            var endId = mode.EndEmote.RowId;
+            var rows = new List<Emote>();
+            if (emoteSheet.GetRowOrDefault(startId) is { } start)
+                rows.Add(start);
+            rows.AddRange(emoteSheet
+                .Where(e => e.EmoteMode.RowId == modeId && e.RowId != startId && e.RowId != endId)
+                .OrderBy(e => e.RowId));
+
+            var poses = new List<StancePose>();
+            foreach (var emote in rows)
+            {
+                var index = (byte)poses.Count;
+                var loop = emote.ActionTimeline.Count > 0 ? emote.ActionTimeline[0].ValueNullable : null;
+                var intro = emote.ActionTimeline.Count > 1 ? emote.ActionTimeline[1].ValueNullable : null;
+                var loopKey = loop?.Key.ExtractText();
+                poses.Add(new StancePose(emote.RowId, emote.TextCommand.RowId != 0, (ushort)(loop?.RowId ?? 0), loopKey));
+
+                // Only stance-specific files identify a pose — the chair/ground intros are
+                // shared event_base files (the sit-down itself)
+                var introKey = intro?.Key.ExtractText();
+                foreach (var key in new[] { loopKey, introKey })
+                {
+                    if (!string.IsNullOrEmpty(key) && key.StartsWith("emote/", System.StringComparison.OrdinalIgnoreCase))
+                        stancePoseKeys.TryAdd(key, (poseType, index));
+                }
+
+                // The intro of pose 2+ is the pose-change transition; pose 1's is the sit-down /
+                // lie-down itself (kept)
+                if (index > 0 && !string.IsNullOrEmpty(introKey) &&
+                    introKey.StartsWith("emote/", System.StringComparison.OrdinalIgnoreCase))
+                    transitionKeys.TryAdd(introKey, poseType);
+            }
+
+            stancePoses[poseType] = poses;
+        }
+
+        var timelineSheet = dataManager.GetExcelSheet<ActionTimeline>();
+        if (timelineSheet == null)
+            return;
+
+        foreach (var timeline in timelineSheet)
+        {
+            var key = timeline.Key.ExtractText();
+            if (!transitionKeys.TryGetValue(key, out var poseType))
+                continue;
+
+            if (!stanceTransitions.TryGetValue(poseType, out var ids))
+                stanceTransitions[poseType] = ids = new Dictionary<ushort, string>();
+            ids[(ushort)timeline.RowId] = key;
+        }
+    }
+
+    /// <summary> The loop timeline (row id and key) of a sit/groundsit/doze pose (0-based), or null. </summary>
+    public (ushort Id, string Key)? GetPoseLoopTimeline(byte poseType, byte poseIndex)
+        => stancePoses.TryGetValue(poseType, out var poses) && poseIndex < poses.Count &&
+           poses[poseIndex].LoopTimeline != 0 && poses[poseIndex].LoopKey != null
+            ? (poses[poseIndex].LoopTimeline, poses[poseIndex].LoopKey!)
+            : null;
+
+    /// <summary>
+    /// The key of a timeline when it is one of this stance's pose-change transitions
+    /// (e.g. emote/l_pose01_start), or null — the sit-down, lie-down and stand-up are not.
+    /// </summary>
+    public string? GetStanceTransitionKey(byte poseType, ushort timelineId)
+        => stanceTransitions.TryGetValue(poseType, out var ids) && ids.TryGetValue(timelineId, out var key) ? key : null;
+
+    /// <summary>
+    /// The pose an animation file plays, from its timeline key (e.g. "emote/l_pose01_loop"):
+    /// (EmoteController.PoseType, 0-based pose index), or null when it is not a pose animation.
+    /// </summary>
+    public (byte PoseType, byte Pose)? GetPoseForAnimationKey(string key)
+    {
+        if (stancePoseKeys.TryGetValue(key, out var pose))
+            return pose;
+
+        var idle = IdlePoseKeyRegex.Match(key);
+        if (idle.Success && byte.TryParse(idle.Groups[1].Value, out var idleIndex))
+            return (0, idleIndex);
+
+        return null;
+    }
+
+    /// <summary>
+    /// The hidden emote that plays exactly this sit/groundsit/doze pose (0-based), or null when
+    /// there is none — or when it is a regular command (/sit needs a real chair; /groundsit is
+    /// played as its command anyway).
+    /// </summary>
+    public uint? GetPoseEmoteId(byte poseType, byte poseIndex)
+        => stancePoses.TryGetValue(poseType, out var poses) && poseIndex < poses.Count && !poses[poseIndex].HasTextCommand
+            ? poses[poseIndex].EmoteId
+            : null;
+
+    /// <summary> The EmoteMode row of a sit/groundsit/doze stance, or null. </summary>
+    public uint? GetStanceModeRow(byte poseType)
+    {
+        foreach (var (modeId, type) in StanceModes)
+        {
+            if (type == poseType)
+                return modeId;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// The EmoteController.PoseType this command selects a pose for (sit/groundsit/doze),
     /// or null when the command is not a pose-mode emote.
     /// </summary>
@@ -155,21 +308,18 @@ public class EmoteIconHelper
 
         if (poseTypeCommands.TryGetValue(cmd, out var poseType))
         {
-            // Pose variants 2+ map to their pose loop file; pose 1 is the base animation
-            if (poseIndex >= 2)
+            // Stance poses: the loop of that pose's emote in the game's pose table
+            if (poseIndex >= 1 && stancePoses.TryGetValue(poseType, out var poses))
             {
-                var prefix = poseType switch
-                {
-                    0 => "",   // standing idle
-                    2 => "s_", // chair sit
-                    3 => "j_", // ground sit
-                    4 => "l_", // doze
-                    _ => null,
-                };
-                if (prefix == null)
-                    return null;
+                return poseIndex - 1 < poses.Count && poses[poseIndex - 1].LoopTimeline != 0
+                    ? poses[poseIndex - 1].LoopTimeline
+                    : null;
+            }
 
-                return poseLoopTimelines.TryGetValue($"emote/{prefix}pose{poseIndex - 1:00}_loop", out var poseTimeline)
+            // Standing idle variants 2+ map to their pose loop file; pose 1 is plain idle
+            if (poseType == 0 && poseIndex >= 2)
+            {
+                return poseLoopTimelines.TryGetValue($"emote/pose{poseIndex - 1:00}_loop", out var poseTimeline)
                     ? poseTimeline
                     : null;
             }
@@ -181,6 +331,14 @@ public class EmoteIconHelper
         }
 
         return commandTimelines.TryGetValue(cmd, out var timeline) ? timeline : null;
+    }
+
+    /// <summary> The ActionTimeline key (e.g. "emote/doze") of a timeline row, or null. </summary>
+    public string? GetTimelineKey(ushort timelineId)
+    {
+        var row = dataManager.GetExcelSheet<ActionTimeline>()?.GetRowOrDefault(timelineId);
+        var key = row?.Key.ExtractText();
+        return string.IsNullOrEmpty(key) ? null : key;
     }
 
     private static string? NormalizeCommand(string command)

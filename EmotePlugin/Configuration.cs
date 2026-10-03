@@ -30,6 +30,22 @@ public class Configuration : IPluginConfiguration
     public bool SitDozeAnywhere { get; set; } = false;
 
     /// <summary>
+    /// After sitting/dozing down, correct the pose with automatic /cpose should the game land on
+    /// another one. Off: the pose is only preselected. (Changing pose while already seated always
+    /// uses /cpose — nothing else changes the current pose.)
+    /// </summary>
+    public bool AutoPoseCorrection { get; set; } = false;
+
+    /// <summary>
+    /// Locally replace sit/groundsit/doze pose transitions (and lying awake before dozing off)
+    /// with the selected pose's loop. Other players still see the transitions.
+    /// </summary>
+    public bool SkipPoseTransitions { get; set; } = true;
+
+    /// <summary> Log the character's emote/pose/animation state for 10s after each emote use. </summary>
+    public bool TraceEmotes { get; set; } = false;
+
+    /// <summary>
     /// Migrate legacy formats: flat Emotes list into RootFolder tree,
     /// and single command/alias fields into per-emote command lists.
     /// </summary>
