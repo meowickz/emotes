@@ -261,6 +261,10 @@ public class EmoteIconHelper
             ? poses[poseIndex].EmoteId
             : null;
 
+    /// <summary> The stance's own start emote (pose 1, e.g. 88 lying in bed awake), or null. </summary>
+    public uint? GetStanceStartEmoteId(byte poseType)
+        => stancePoses.TryGetValue(poseType, out var poses) && poses.Count > 0 ? poses[0].EmoteId : null;
+
     /// <summary> The EmoteMode row of a sit/groundsit/doze stance, or null. </summary>
     public uint? GetStanceModeRow(byte poseType)
     {

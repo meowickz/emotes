@@ -46,6 +46,9 @@ public class EmoteManager : IDisposable
 
     // Wait this long after entering the stance before the first /cpose
     private static readonly TimeSpan PoseStanceSettle = TimeSpan.FromSeconds(0.5);
+    // Lying awake (doze entered via a pose emote) is a settled state: /cpose right away, and
+    // resend quickly — every moment there shows the vanilla lie-down loop
+    private static readonly TimeSpan PoseStepRetryLyingAwake = TimeSpan.FromMilliseconds(250);
 
     // Resend a /cpose that didn't change the pose after this long (dropped mid-transition)
     private static readonly TimeSpan PoseStepRetry = TimeSpan.FromSeconds(1.2);
@@ -476,6 +479,12 @@ public class EmoteManager : IDisposable
         if (!isNew || current == 0 || current == skip.TargetLoop)
             return;
 
+        // Only pose changes within the stance: the entry (e.g. the hidden pose emote lying down
+        // from standing) plays normally — swapping it would flash the loop for a frame before
+        // the game's lying-awake loop takes over
+        if ((byte)ec->CurrentPoseType != skip.Stance)
+            return;
+
         var key = emoteData.GetStanceTransitionKey(skip.Stance, current);
         if (key == null)
             return;
@@ -800,6 +809,20 @@ public class EmoteManager : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Whether the local player is in the stance's mode playing its own start emote's loop
+    /// without having taken the stance's pose yet — lying in bed awake (emote 88) before dozing off.
+    /// </summary>
+    private unsafe bool IsInStanceStartLoop(byte stance)
+    {
+        var chara = GetLocalCharacter();
+        if (chara == null || (byte)chara->EmoteController.CurrentPoseType == stance)
+            return false;
+
+        var startEmote = emoteData.GetStanceStartEmoteId(stance);
+        return startEmote != null && chara->EmoteController.EmoteId == startEmote;
+    }
+
     /// <summary> The local player's current pose stance and pose index, or null when unavailable. </summary>
     private unsafe (byte PoseType, byte PoseIndex)? GetLocalPoseState()
     {
@@ -848,6 +871,7 @@ public class EmoteManager : IDisposable
 
         // Sit/groundsit/doze count lying awake (bed mode, before dozing off) as pose 1
         byte? stanceIndex;
+        var lyingAwake = false;
         if (pose.PoseType == 0)
         {
             var state = GetLocalPoseState();
@@ -856,6 +880,7 @@ public class EmoteManager : IDisposable
         else
         {
             stanceIndex = GetStancePoseIndex(pose.PoseType);
+            lyingAwake = stanceIndex != null && IsInStanceStartLoop(pose.PoseType);
         }
 
         if (stanceIndex == null)
@@ -867,7 +892,7 @@ public class EmoteManager : IDisposable
         // The sit-down plays first and the pose index can lag behind the stance —
         // acting on it right away cycles away from a correctly entered pose
         pose.InStanceSince ??= now;
-        if (pose.SentFromIndex == null && now - pose.InStanceSince < PoseStanceSettle)
+        if (pose.SentFromIndex == null && !lyingAwake && now - pose.InStanceSince < PoseStanceSettle)
             return;
 
         // Per Poser: GetAvailablePoses returns the highest valid pose index
@@ -885,7 +910,7 @@ public class EmoteManager : IDisposable
         }
 
         // Previous step still pending — give it time to land before resending
-        if (pose.SentFromIndex == current && now - pose.SentAt < PoseStepRetry)
+        if (pose.SentFromIndex == current && now - pose.SentAt < (lyingAwake ? PoseStepRetryLyingAwake : PoseStepRetry))
             return;
 
         // Extend the deadline on the first step and on progress, never on a resend,
