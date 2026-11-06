@@ -45,6 +45,15 @@ public class Configuration : IPluginConfiguration
     /// <summary> Log the character's emote/pose/animation state for 10s after each emote use. </summary>
     public bool TraceEmotes { get; set; } = false;
 
+    /// <summary> With TraceEmotes: also sample the body animation clips (time/length/blend weight) every 100ms. </summary>
+    public bool TraceAnimation { get; set; } = false;
+
+    /// <summary>
+    /// Mod directories the mod scanner has listed in an import. Lets a later scan tell mods that
+    /// are truly new apart from ones the user already saw and chose not to import.
+    /// </summary>
+    public List<string> ScannedModDirectories { get; set; } = new();
+
     /// <summary>
     /// Migrate legacy formats: flat Emotes list into RootFolder tree,
     /// and single command/alias fields into per-emote command lists.

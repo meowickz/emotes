@@ -27,7 +27,16 @@ public class EmoteManager : IDisposable
     private readonly IPluginLog log;
 
     private EmoteEntry? lastUsedEmote;
-    private string? lastUsedCommand;
+    // What the last use applied (see ModSettingsKey) — a redraw only helps when this changes
+    private string? lastAppliedModsKey;
+
+    // The last emote actually played: its command, and its mod settings when it played modded
+    // (null = vanilla). Only a directly following play of the same command with another mod's
+    // settings collides with the still-loaded animation and needs a redraw — another emote in
+    // between, vanilla -> mod and mod -> vanilla all load fresh.
+    private (string Command, string? ModsKey)? lastPlayed;
+    // The draw object that play belongs to: a new one (zoning, any redraw) reloaded everything
+    private nint lastPlayedDrawObject;
 
     // A pose change waiting for the character to enter the right stance, stepped one /cpose at a time
     private PendingPose? pendingPose;
@@ -168,7 +177,7 @@ public class EmoteManager : IDisposable
         if (lastUsedEmote?.Id == emote.Id)
         {
             lastUsedEmote = null;
-            lastUsedCommand = null;
+            lastAppliedModsKey = null;
         }
         var folder = FindParentFolder(emote);
         folder?.Emotes.Remove(emote);
@@ -228,12 +237,13 @@ public class EmoteManager : IDisposable
         var inStance = poseType is not null and not 0 && GetStancePoseIndex(poseType.Value) != null;
 
         var redraw = false;
+        // This use's mod settings when it plays modded, recorded as lastPlayed (null = vanilla)
+        string? playedKey = null;
         if (emote.AutoToggleMod)
         {
-            var lastCmd = lastUsedCommand?.TrimStart('/');
-            var normalizedCmd = cmd.Command.TrimStart('/');
-            var sameCommand = lastCmd != null && lastCmd.Equals(normalizedCmd, StringComparison.OrdinalIgnoreCase);
             var newEmote = lastUsedEmote?.Id != emote.Id;
+            var modsKey = ModSettingsKey(emote);
+            var modsChanged = modsKey != lastAppliedModsKey;
 
             // Remove previous emote's temporary mod settings before applying new ones
             if (lastUsedEmote != null && newEmote)
@@ -242,13 +252,18 @@ public class EmoteManager : IDisposable
             ApplyAssociatedMods(emote);
 
             lastUsedEmote = emote;
-            lastUsedCommand = cmd.Command;
+            lastAppliedModsKey = modsKey;
+            var modded = AppliesAnyMod(emote);
+            if (modded)
+                playedKey = modsKey;
 
-            // A redraw reloads animations the character already has loaded: needed when the
-            // previous emote used the same command (same animation files), or when another
-            // emote's mods replace the stance animation playing right now. A pose change within
-            // the same emote loads a different file, so it skips the redraw (and its disruption).
-            redraw = configuration.AlwaysRedraw || (inStance ? newEmote : sameCommand);
+            // A redraw (the character briefly vanishes) reloads animations the character already
+            // has loaded — only useful when the mod settings behind them changed: the emote played
+            // right before used the same command with another mod, or another emote's mods replace
+            // the stance animation playing right now. Replaying the same emote, or a pose change
+            // within it, skips the redraw.
+            redraw = configuration.AlwaysRedraw || (modded && FollowsSameCommandWithOtherMods(cmd.Command, modsKey)) ||
+                     (inStance && modsChanged);
         }
 
         Trace($"Decision: poseType={poseType?.ToString() ?? "none"} inStance={inStance} redraw={redraw}");
@@ -263,6 +278,7 @@ public class EmoteManager : IDisposable
             WaitingForRedraw = redraw && penumbraService.RedrawSelf(),
             NotBefore = now,
             Deadline = now + RedrawTimeout,
+            ModsKey = playedKey,
         };
     }
 
@@ -277,6 +293,8 @@ public class EmoteManager : IDisposable
         public DateTime NotBefore;
         // Play anyway when the redraw-finished event never arrives
         public DateTime Deadline;
+        // The mod settings it plays with when modded (null = vanilla), recorded once played
+        public string? ModsKey;
     }
 
     // Let the freshly redrawn character settle before the emote starts
@@ -285,6 +303,9 @@ public class EmoteManager : IDisposable
 
     private void OnLocalPlayerRedrawn()
     {
+        // Every animation reloads with the current settings
+        lastPlayed = null;
+
         if (pendingPlay is not { WaitingForRedraw: true } play)
             return;
 
@@ -580,8 +601,11 @@ public class EmoteManager : IDisposable
 
             ApplyAssociatedMods(emote);
             lastUsedEmote = emote;
-            lastUsedCommand = null;
+            lastAppliedModsKey = ModSettingsKey(emote);
         }
+
+        // The preview loads this command's animation with those settings, like a real play
+        RecordPlayed(cmd.Command, emote.AutoToggleMod && AppliesAnyMod(emote) ? ModSettingsKey(emote) : null);
 
         // Keep the FIRST original state when chaining previews
         previewOriginalState ??= (chara->Mode, chara->ModeParam, chara->Timeline.BaseOverride);
@@ -594,6 +618,47 @@ public class EmoteManager : IDisposable
         log.Information($"Previewing emote: {emote.Name} (timeline {timelineId.Value}, local only)");
         return true;
     }
+
+    /// <summary> Whether using this emote turns any mod on (Auto-apply with an enabled association). </summary>
+    private static bool AppliesAnyMod(EmoteEntry emote)
+        => emote.AssociatedMods.Any(m => m.Enabled);
+
+    /// <summary>
+    /// Whether the emote played right before used this command modded with other mod settings —
+    /// that modded animation is still loaded and the new one would collide with it.
+    /// </summary>
+    private bool FollowsSameCommandWithOtherMods(string command, string modsKey)
+    {
+        SyncLastPlayedWithDrawObject();
+        return lastPlayed is { ModsKey: { } previous } played &&
+               played.Command.Equals(command.TrimStart('/'), StringComparison.OrdinalIgnoreCase) &&
+               previous != modsKey;
+    }
+
+    private void RecordPlayed(string command, string? modsKey)
+    {
+        SyncLastPlayedWithDrawObject();
+        lastPlayed = (command.TrimStart('/'), modsKey);
+    }
+
+    /// <summary> A new draw object (zoning, a redraw not via Penumbra) has nothing loaded yet. </summary>
+    private unsafe void SyncLastPlayedWithDrawObject()
+    {
+        var chara = GetLocalCharacter();
+        var drawObject = chara == null ? nint.Zero : (nint)chara->DrawObject;
+        if (drawObject == lastPlayedDrawObject)
+            return;
+
+        lastPlayed = null;
+        lastPlayedDrawObject = drawObject;
+    }
+
+    /// <summary> The mod settings an emote applies, as a comparable string. </summary>
+    private static string ModSettingsKey(EmoteEntry emote)
+        => $"{emote.PenumbraCollectionId}|" + string.Join(";", emote.AssociatedMods.Select(m =>
+            $"{m.ModDirectory}:{m.Enabled}:{m.Inherit}:{m.Priority}:" +
+            string.Join(",", (m.Settings ?? new()).OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => $"{kv.Key}={string.Join("+", kv.Value)}"))));
 
     private void ApplyAssociatedMods(EmoteEntry emote)
     {
@@ -674,6 +739,10 @@ public class EmoteManager : IDisposable
     private DateTime traceUntil;
     private string? lastTraceState;
     private readonly HashSet<ushort> tracedTimelines = new();
+    // Body animation playback (Havok controls) is sampled, not change-logged: its time moves every frame
+    private static readonly TimeSpan AnimTraceInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan AnimTraceDuration = TimeSpan.FromSeconds(10);
+    private DateTime nextAnimTrace;
 
     private void StartTrace(string message)
     {
@@ -684,6 +753,7 @@ public class EmoteManager : IDisposable
         traceUntil = traceStart + TraceDuration;
         lastTraceState = null;
         tracedTimelines.Clear();
+        nextAnimTrace = default;
         Trace(message);
     }
 
@@ -750,6 +820,48 @@ public class EmoteManager : IDisposable
             var resolved = penumbraService.ResolvePlayerPath(gamePath);
             Trace($"File for {key}: {(resolved == null ? "(Penumbra unavailable)" : resolved.Equals(gamePath, StringComparison.OrdinalIgnoreCase) ? "vanilla " + gamePath : resolved)}");
         }
+
+        TraceAnimationControls(chara);
+    }
+
+    /// <summary>
+    /// Sample the body skeleton's Havok animation controls: which clips play (by length), where in
+    /// each clip, and their blend weight — shows the clip actually loaded (e.g. an edited .pap) and
+    /// when it starts moving relative to the command.
+    /// </summary>
+    private unsafe void TraceAnimationControls(FFXIVClientStructs.FFXIV.Client.Game.Character.Character* chara)
+    {
+        if (!configuration.TraceAnimation)
+            return;
+
+        var now = DateTime.UtcNow;
+        if (now < nextAnimTrace || now > traceStart + AnimTraceDuration)
+            return;
+        nextAnimTrace = now + AnimTraceInterval;
+
+        var drawObject = (FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase*)chara->DrawObject;
+        if (drawObject == null || drawObject->Skeleton == null || drawObject->Skeleton->PartialSkeletonCount == 0)
+            return;
+
+        var animated = drawObject->Skeleton->PartialSkeletons[0].GetHavokAnimatedSkeleton(0);
+        if (animated == null)
+            return;
+
+        var controls = new List<string>();
+        for (var i = 0; i < animated->AnimationControls.Length; i++)
+        {
+            var control = animated->AnimationControls[i].Value;
+            if (control == null)
+                continue;
+
+            var binding = control->hkaAnimationControl.Binding.ptr;
+            var animation = binding == null ? null : binding->Animation.ptr;
+            var duration = animation == null ? 0f : animation->Duration;
+            controls.Add($"{i}: {control->hkaAnimationControl.LocalTime:0.00}/{duration:0.00}s " +
+                         $"w={control->hkaAnimationControl.Weight * control->MasterWeight:0.00} x{control->PlaybackSpeed:0.##}");
+        }
+
+        Trace($"Anim: {string.Join(" | ", controls)}");
     }
 
     /// <summary> The local character's race/sex model code (e.g. 101 = c0101), or null. </summary>
@@ -810,6 +922,27 @@ public class EmoteManager : IDisposable
     }
 
     /// <summary>
+    /// The current standing idle pose (0-based) when standing normally, or null. The pose type
+    /// only reads Idle (0) after a /cpose — standing before that reports none (255) — so the
+    /// remembered idle pose stands in for the current one then.
+    /// </summary>
+    private unsafe byte? GetIdlePoseIndex()
+    {
+        var chara = GetLocalCharacter();
+        if (chara == null || chara->Mode != FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes.Normal)
+            return null;
+
+        var poseType = (byte)chara->EmoteController.CurrentPoseType;
+        if (poseType == 0)
+            return chara->EmoteController.CPoseState;
+        if (poseType != byte.MaxValue)
+            return null; // seated, dozing, ...
+
+        var playerState = PlayerState.Instance();
+        return playerState == null ? null : playerState->SelectedPoses[0];
+    }
+
+    /// <summary>
     /// Whether the local player is in the stance's mode playing its own start emote's loop
     /// without having taken the stance's pose yet — lying in bed awake (emote 88) before dozing off.
     /// </summary>
@@ -853,6 +986,7 @@ public class EmoteManager : IDisposable
             pendingPlay = null;
             Trace(play.WaitingForRedraw ? "Playing (redraw event never arrived, timeout)." : "Playing.");
             PlayEmote(play.Emote, play.Command);
+            RecordPlayed(play.Command.Command, play.ModsKey);
         }
 
 
@@ -874,8 +1008,7 @@ public class EmoteManager : IDisposable
         var lyingAwake = false;
         if (pose.PoseType == 0)
         {
-            var state = GetLocalPoseState();
-            stanceIndex = state?.PoseType == 0 ? state.Value.PoseIndex : null;
+            stanceIndex = GetIdlePoseIndex();
         }
         else
         {
@@ -1245,7 +1378,7 @@ public class EmoteManager : IDisposable
             }
         }
         lastUsedEmote = null;
-        lastUsedCommand = null;
+        lastAppliedModsKey = null;
         penumbraService.RedrawSelf();
     }
 }

@@ -102,6 +102,13 @@ public class MainWindow : Window, IDisposable
     // Import/export state
     private readonly FileDialogManager fileDialog = new();
     // Mod scanner state
+    private enum ScanStatus
+    {
+        New,     // never listed by an earlier scan
+        Skipped, // listed by an earlier scan, not imported
+        Exists,  // already associated with an emote
+    }
+
     private sealed class ScanCandidate
     {
         public required string ModDirectory;
@@ -109,12 +116,14 @@ public class MainWindow : Window, IDisposable
         public string EmoteName = string.Empty;
         public string CommandsTooltip = string.Empty;
         public bool Selected;
-        public bool AlreadyUsed;
+        public ScanStatus Status;
         public List<(string Command, string Name, int Pose)> Rows = new();
     }
 
     private List<ScanCandidate>? pendingScan;
     private bool scanPopupPending;
+    private string scanSearch = string.Empty;
+    private ScanStatus? scanStatusFilter;
     private Guid scanTargetFolderId = Guid.Empty;
     private string scanTargetFolderLabel = "(Root)";
 
@@ -178,6 +187,8 @@ public class MainWindow : Window, IDisposable
         foreach (var existing in emoteManager.GetRootFolder().EnumerateEmotes())
         foreach (var mod in existing.AssociatedMods)
             usedDirs.Add(mod.ModDirectory);
+        var scannedDirs = new HashSet<string>(plugin.Configuration.ScannedModDirectories,
+            StringComparer.OrdinalIgnoreCase);
 
         var modRoot = penumbraService.GetModRootDirectory();
         var candidates = new List<ScanCandidate>();
@@ -209,15 +220,17 @@ public class MainWindow : Window, IDisposable
                 continue;
 
             var name = cachedMods.TryGetValue(dir, out var n) && !string.IsNullOrWhiteSpace(n) ? n : dir;
-            var alreadyUsed = usedDirs.Contains(dir);
+            var status = usedDirs.Contains(dir) ? ScanStatus.Exists
+                : scannedDirs.Contains(dir) ? ScanStatus.Skipped
+                : ScanStatus.New;
             var rows = FinalizeDetectedRows(detected);
             candidates.Add(new ScanCandidate
             {
                 ModDirectory = dir,
                 ModName = name,
                 EmoteName = name,
-                Selected = !alreadyUsed,
-                AlreadyUsed = alreadyUsed,
+                Selected = status == ScanStatus.New,
+                Status = status,
                 Rows = rows,
                 CommandsTooltip = string.Join("\n", rows.Select(
                     r => r.Pose > 0 ? $"{r.Command} (pose {r.Pose})" : r.Command)),
@@ -234,7 +247,23 @@ public class MainWindow : Window, IDisposable
         pendingScan = candidates;
         scanTargetFolderId = Guid.Empty;
         scanTargetFolderLabel = "(Root)";
+        scanSearch = string.Empty;
+        scanStatusFilter = null;
         scanPopupPending = true;
+    }
+
+    /// <summary> Whether a scan row passes the review dialog's search and status filter. </summary>
+    private bool IsScanCandidateShown(ScanCandidate c)
+    {
+        if (scanStatusFilter != null && c.Status != scanStatusFilter)
+            return false;
+        if (string.IsNullOrWhiteSpace(scanSearch))
+            return true;
+        var q = scanSearch.Trim();
+        return c.ModName.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.ModDirectory.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.EmoteName.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.CommandsTooltip.Contains(q, StringComparison.OrdinalIgnoreCase);
     }
 
     private void DrawScanPopup()
@@ -257,25 +286,53 @@ public class MainWindow : Window, IDisposable
         }
 
         var selectedCount = pendingScan.Count(c => c.Selected);
-        ImGui.Text($"Found {pendingScan.Count} mod(s) with emote animations — importing {selectedCount} as new emotes.");
-        ImGui.TextWrapped("Edit the emote names, untick mods you don't want. Mods already associated with an " +
-                          "existing emote are unticked by default.");
+        var newCount = pendingScan.Count(c => c.Status == ScanStatus.New);
+        ImGui.Text($"Found {pendingScan.Count} mod(s) with emote animations ({newCount} new) — " +
+                   $"importing {selectedCount} as new emotes.");
+        ImGui.TextWrapped("Edit the emote names, untick mods you don't want. Only new mods are ticked by default; " +
+                          "mods you skipped in an earlier import or that already have an emote are not.");
 
-        if (ImGui.SmallButton("Select All"))
+        using (ImRaii.PushStyle(ImGuiStyleVar.FrameRounding, 0f))
         {
-            foreach (var c in pendingScan)
-                c.Selected = true;
+            ImGui.SetNextItemWidth(260);
+            ImGui.InputTextWithHint("##ScanSearch", "Search mods, names, commands...", ref scanSearch, 128);
         }
+
         ImGui.SameLine();
-        if (ImGui.SmallButton("Select None"))
+        ImGui.SetNextItemWidth(130);
+        if (ImGui.BeginCombo("##ScanStatusFilter", scanStatusFilter?.ToString() ?? "All statuses"))
         {
-            foreach (var c in pendingScan)
-                c.Selected = false;
+            if (ImGui.Selectable("All statuses", scanStatusFilter == null))
+                scanStatusFilter = null;
+            foreach (var status in Enum.GetValues<ScanStatus>())
+            {
+                if (ImGui.Selectable(status.ToString(), scanStatusFilter == status))
+                    scanStatusFilter = status;
+            }
+            ImGui.EndCombo();
         }
 
         ImGui.SameLine();
         ImGui.SetNextItemWidth(220);
         DrawScanFolderCombo();
+
+        if (ImGui.SmallButton("Select Shown"))
+        {
+            foreach (var c in pendingScan.Where(IsScanCandidateShown))
+                c.Selected = true;
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Deselect Shown"))
+        {
+            foreach (var c in pendingScan.Where(IsScanCandidateShown))
+                c.Selected = false;
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select New Only"))
+        {
+            foreach (var c in pendingScan)
+                c.Selected = c.Status == ScanStatus.New;
+        }
 
         ImGui.Spacing();
 
@@ -352,12 +409,15 @@ public class MainWindow : Window, IDisposable
         ImGui.TableSetupColumn("Mod", ImGuiTableColumnFlags.WidthStretch, 0.45f);
         ImGui.TableSetupColumn("Emote Name", ImGuiTableColumnFlags.WidthStretch, 0.45f);
         ImGui.TableSetupColumn("Commands", ImGuiTableColumnFlags.WidthFixed, 74);
-        ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 52);
+        ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 60);
         ImGui.TableHeadersRow();
 
         for (var i = 0; i < pendingScan.Count; i++)
         {
             var candidate = pendingScan[i];
+            if (!IsScanCandidateShown(candidate))
+                continue;
+
             ImGui.TableNextRow();
             ImGui.PushID(i);
 
@@ -388,15 +448,23 @@ public class MainWindow : Window, IDisposable
 
             ImGui.TableNextColumn();
             ImGui.AlignTextToFramePadding();
-            if (candidate.AlreadyUsed)
+            switch (candidate.Status)
             {
-                ImGui.TextDisabled("Exists");
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip("This mod is already associated with an existing emote.");
-            }
-            else
-            {
-                ImGui.TextColored(new Vector4(0.35f, 0.9f, 0.35f, 1f), "New");
+                case ScanStatus.Exists:
+                    ImGui.TextDisabled("Exists");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("This mod is already associated with an existing emote.");
+                    break;
+                case ScanStatus.Skipped:
+                    ImGui.TextColored(new Vector4(0.9f, 0.75f, 0.35f, 1f), "Skipped");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Listed in an earlier scan import, but not imported then.");
+                    break;
+                default:
+                    ImGui.TextColored(new Vector4(0.35f, 0.9f, 0.35f, 1f), "New");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Not listed in any earlier scan import.");
+                    break;
             }
 
             ImGui.PopID();
@@ -439,6 +507,16 @@ public class MainWindow : Window, IDisposable
             emoteManager.AddEmote(emote, target);
             emoteManager.SyncModSettingsFromPenumbra(emote, mod);
         }
+
+        // Every listed mod has now been reviewed — unticked ones show as Skipped, not New, next scan
+        var scanned = plugin.Configuration.ScannedModDirectories;
+        var known = new HashSet<string>(scanned, StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in pendingScan)
+        {
+            if (known.Add(candidate.ModDirectory))
+                scanned.Add(candidate.ModDirectory);
+        }
+        plugin.Configuration.Save();
 
         pendingScan = null;
     }
@@ -603,6 +681,21 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Diagnostics: for 20 seconds after each emote, log every change of stance, pose,\n" +
                              "character mode and playing animation (with the file Penumbra loads for it)\n" +
                              "to /xllog, prefixed with [Trace].");
+
+        ImGui.Indent();
+        ImGui.BeginDisabled(!traceEmotes);
+        var traceAnimation = plugin.Configuration.TraceAnimation;
+        if (ImGui.Checkbox("Trace Animation Timing", ref traceAnimation))
+        {
+            plugin.Configuration.TraceAnimation = traceAnimation;
+            plugin.Configuration.Save();
+        }
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Also log the body animation clips every 0.1s for the first 10 seconds:\n" +
+                             "time into each clip / clip length, blend weight and speed. Shows which\n" +
+                             "version of an animation file the game actually plays (e.g. an edited .pap).");
+        ImGui.Unindent();
 
         ImGui.Spacing();
         ImGui.Separator();

@@ -6,7 +6,7 @@
   "ApplicableVersion": "any",
   "RepoUrl": "https://github.com/meowickz/emotes",
   "IconUrl": "https://raw.githubusercontent.com/meowickz/emotes/master/assets/icon.png",
-  "Changelog": "Mod scanner now filters out VFX-only mods (requires an actual emote animation); Stop Preview is disabled when nothing is previewing.",
+  "Changelog": "Reworked sit/ground sit/doze pose selection (game pose order, direct entry, single /cpose switches, shorter doze lying-awake, optional transition skip); emotes wait for Penumbra's redraw; scanner remembers skipped mods and adds search/filters; playback trace settings; latest Penumbra API.",
   "Tags": [
     "emote",
     "penumbra",

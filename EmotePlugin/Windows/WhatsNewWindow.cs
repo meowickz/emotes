@@ -9,6 +9,16 @@ public class WhatsNewWindow : Window, IDisposable
 {
     private static readonly (string Version, string[] Changes)[] Changelog =
     {
+        ("1.4.0.0", new[]
+        {
+            "Reworked sit, ground sit and doze pose selection: poses now follow the game's own pose order, stances are entered directly in the chosen pose, and changing pose while seated takes a single /cpose.",
+            "Doze: the lying-awake phase after lying down is cut short, so you settle into the chosen pose almost immediately.",
+            "Skip Sit/Doze Pose Transitions (on by default): switching poses jumps straight to the new pose instead of playing the transition animation — client-side only, like the preview.",
+            "Emotes now wait for Penumbra's redraw to finish before playing, so they're no longer cancelled by the redraw.",
+            "Mod library scanner: reads more mod formats, and remembers which mods you skipped — only new mods are ticked by default, with a New/Skipped/Exists status, search, status filter and Select New Only.",
+            "Trace Emote Playback and Trace Animation Timing settings log emote and animation state to /xllog for troubleshooting.",
+            "Updated to the latest Penumbra API.",
+        }),
         ("1.3.1.0", new[]
         {
             "Mod library scanner now filters out VFX/effect-only mods — a mod must replace an actual emote animation to appear in the scan.",
